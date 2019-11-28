@@ -1,44 +1,23 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{compiler::compile_module, parser::parse_module};
-use std::{
-    fs,
-    path::{Path, PathBuf},
+use bytecode_source_map::source_map::ModuleSourceMap;
+use failure::prelude::*;
+use ir_to_bytecode::{
+    compiler::compile_module,
+    parser::{ast::Loc, parse_module},
 };
-use types::account_address::AccountAddress;
-use vm::file_format::CompiledModule;
+use libra_types::account_address::AccountAddress;
+use std::{fs, path::Path};
+use vm::{access::ModuleAccess, file_format::CompiledModule};
 
-pub fn do_compile_module(
+pub fn do_compile_module<T: ModuleAccess>(
     source_path: &Path,
-    address: &AccountAddress,
-    dependencies: &[CompiledModule],
-) -> CompiledModule {
+    address: AccountAddress,
+    dependencies: &[T],
+) -> (CompiledModule, ModuleSourceMap<Loc>) {
     let source = fs::read_to_string(source_path)
-        .unwrap_or_else(|_| panic!("Unable to read file: {:?}", source_path));
+        .unwrap_or_else(|_| unrecoverable!("Unable to read file: {:?}", source_path));
     let parsed_module = parse_module(&source).unwrap();
-    compile_module(address, &parsed_module, dependencies).unwrap()
-}
-
-pub fn build_stdlib() -> Vec<CompiledModule> {
-    // TODO: Change source paths for stdlib when we have proper SDK packaging.
-    let mut stdlib_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    stdlib_root.pop();
-    stdlib_root.push("stdlib");
-
-    let address = AccountAddress::default();
-    let mut stdlib_modules = Vec::<CompiledModule>::new();
-    for e in [
-        "modules/hash.mvir",
-        "modules/signature.mvir",
-        "modules/libra_coin.mvir",
-        "modules/libra_account.mvir",
-        "modules/validator_set.mvir",
-    ]
-    .iter()
-    {
-        let res = do_compile_module(&Path::join(&stdlib_root, e), &address, &stdlib_modules);
-        stdlib_modules.push(res);
-    }
-    stdlib_modules
+    compile_module(address, parsed_module, dependencies).unwrap()
 }

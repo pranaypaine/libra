@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! Suppose we have the following data structure in a smart contract:
 //!
 //! struct B {
@@ -35,51 +37,41 @@
 //! On the other hand, if you want to query only <Alice>/a/*, `address` will be set to Alice and
 //! `path` will be set to "/a" and use the `get_prefix()` method from statedb
 
-// This is caused by deriving Arbitrary for AccessPath.
-#![allow(clippy::unit_arg)]
-
 use crate::{
     account_address::AccountAddress,
     account_config::{
-        account_received_event_path, account_resource_path, account_sent_event_path,
-        association_address,
+        account_resource_path, association_address, ACCOUNT_RECEIVED_EVENT_PATH,
+        ACCOUNT_SENT_EVENT_PATH,
     },
-    language_storage::{CodeKey, ResourceKey, StructTag},
+    identifier::{IdentStr, Identifier},
+    language_storage::{ModuleId, ResourceKey, StructTag},
     validator_set::validator_set_path,
 };
-use canonical_serialization::{
-    CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-};
-use crypto::hash::{CryptoHash, HashValue};
 use failure::prelude::*;
 use hex;
 use lazy_static::lazy_static;
+use libra_crypto::hash::{CryptoHash, HashValue};
+use mirai_annotations::*;
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto};
 use radix_trie::TrieKey;
 use serde::{Deserialize, Serialize};
 use std::{
-    fmt::{self, Formatter},
+    convert::{TryFrom, TryInto},
+    fmt,
     slice::Iter,
-    str::{self, FromStr},
 };
 
-#[derive(Default, Serialize, Deserialize, Debug, PartialEq, Hash, Eq, Clone, Ord, PartialOrd)]
-pub struct Field(String);
+#[derive(Serialize, Deserialize, Debug, PartialEq, Hash, Eq, Clone, Ord, PartialOrd)]
+pub struct Field(Identifier);
 
 impl Field {
-    pub fn new(s: &str) -> Field {
-        Field(s.to_string())
+    pub fn new(name: Identifier) -> Field {
+        Field(name)
     }
 
-    pub fn name(&self) -> &String {
+    pub fn name(&self) -> &IdentStr {
         &self.0
-    }
-}
-
-impl From<String> for Field {
-    fn from(s: String) -> Self {
-        Field(s)
     }
 }
 
@@ -96,20 +88,8 @@ pub enum Access {
 }
 
 impl Access {
-    pub fn new(s: &str) -> Self {
-        Access::Field(Field::new(s))
-    }
-}
-
-impl FromStr for Access {
-    type Err = ::std::num::ParseIntError;
-
-    fn from_str(s: &str) -> ::std::result::Result<Self, Self::Err> {
-        if let Ok(idx) = s.parse::<u64>() {
-            Ok(Access::Index(idx))
-        } else {
-            Ok(Access::Field(Field::new(s)))
-        }
+    pub fn new(name: Identifier) -> Self {
+        Access::Field(Field::new(name))
     }
 }
 
@@ -125,6 +105,7 @@ impl fmt::Display for Access {
 /// Non-empty sequence of field accesses
 #[derive(Eq, Hash, Serialize, Deserialize, Debug, Clone, PartialEq, Ord, PartialOrd)]
 pub struct Accesses(Vec<Access>);
+// invariant self.0.len() == 1
 
 /// SEPARATOR is used as a delimiter between fields. It should not be a legal part of any identifier
 /// in the language
@@ -160,6 +141,7 @@ impl Accesses {
 
     /// Return the last access in the sequence
     pub fn last(&self) -> &Access {
+        assume!(self.0.last().is_some()); // follows from invariant
         self.0.last().unwrap() // guaranteed not to fail because sequence is non-empty
     }
 
@@ -180,7 +162,7 @@ impl Accesses {
         for access in self.0.iter() {
             match access {
                 Access::Field(s) => {
-                    let access_str = s.name().as_ref();
+                    let access_str = s.name().as_str();
                     assert!(access_str != "");
                     path.push_str(access_str)
                 }
@@ -211,20 +193,6 @@ impl From<Vec<Access>> for Accesses {
     }
 }
 
-impl From<Vec<u8>> for Accesses {
-    fn from(mut raw_bytes: Vec<u8>) -> Accesses {
-        let access_str = String::from_utf8(raw_bytes.split_off(HashValue::LENGTH + 1)).unwrap();
-        let fields_str = access_str.split(SEPARATOR).collect::<Vec<&str>>();
-        let mut accesses = vec![];
-        for access_str in fields_str.into_iter() {
-            if access_str != "" {
-                accesses.push(Access::from_str(access_str).unwrap());
-            }
-        }
-        Accesses::from(accesses)
-    }
-}
-
 impl TrieKey for Accesses {
     fn encode_bytes(&self) -> Vec<u8> {
         self.as_separated_string().into_bytes()
@@ -237,21 +205,8 @@ lazy_static! {
         AccessPath::new(association_address(), validator_set_path());
 }
 
-#[derive(
-    Clone,
-    Eq,
-    PartialEq,
-    Default,
-    Hash,
-    Serialize,
-    Deserialize,
-    Ord,
-    PartialOrd,
-    Arbitrary,
-    FromProto,
-    IntoProto,
-)]
-#[ProtoType(crate::proto::access_path::AccessPath)]
+#[derive(Clone, Eq, PartialEq, Default, Hash, Serialize, Deserialize, Ord, PartialOrd)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct AccessPath {
     pub address: AccountAddress,
     pub path: Vec<u8>,
@@ -287,7 +242,7 @@ impl AccessPath {
     /// That AccessPath can be used as a key into the event storage to retrieve all sent
     /// events for a given account.
     pub fn new_for_sent_event(address: AccountAddress) -> Self {
-        Self::new(address, account_sent_event_path())
+        Self::new(address, ACCOUNT_SENT_EVENT_PATH.to_vec())
     }
 
     /// Create an AccessPath to the event for the target account (the receiver)
@@ -297,7 +252,7 @@ impl AccessPath {
     /// That AccessPath can be used as a key into the event storage to retrieve all received
     /// events for a given account.
     pub fn new_for_received_event(address: AccountAddress) -> Self {
-        Self::new(address, account_received_event_path())
+        Self::new(address, ACCOUNT_RECEIVED_EVENT_PATH.to_vec())
     }
 
     pub fn resource_access_vec(tag: &StructTag, accesses: &Accesses) -> Vec<u8> {
@@ -322,14 +277,14 @@ impl AccessPath {
         }
     }
 
-    fn code_access_path_vec(key: &CodeKey) -> Vec<u8> {
+    fn code_access_path_vec(key: &ModuleId) -> Vec<u8> {
         let mut root = vec![];
         root.push(Self::CODE_TAG);
         root.append(&mut key.hash().to_vec());
         root
     }
 
-    pub fn code_access_path(key: &CodeKey) -> AccessPath {
+    pub fn code_access_path(key: &ModuleId) -> AccessPath {
         let path = AccessPath::code_access_path_vec(key);
         AccessPath {
             address: *key.address(),
@@ -350,7 +305,7 @@ impl fmt::Debug for AccessPath {
 }
 
 impl fmt::Display for AccessPath {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.path.len() < 1 + HashValue::LENGTH {
             write!(f, "{:?}", self)
         } else {
@@ -374,20 +329,19 @@ impl fmt::Display for AccessPath {
     }
 }
 
-impl CanonicalSerialize for AccessPath {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer
-            .encode_struct(&self.address)?
-            .encode_variable_length_bytes(&self.path)?;
-        Ok(())
+impl TryFrom<crate::proto::types::AccessPath> for AccessPath {
+    type Error = Error;
+
+    fn try_from(proto: crate::proto::types::AccessPath) -> Result<Self> {
+        Ok(AccessPath::new(proto.address.try_into()?, proto.path))
     }
 }
 
-impl CanonicalDeserialize for AccessPath {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let address = deserializer.decode_struct::<AccountAddress>()?;
-        let path = deserializer.decode_variable_length_bytes()?;
-
-        Ok(Self { address, path })
+impl From<AccessPath> for crate::proto::types::AccessPath {
+    fn from(path: AccessPath) -> Self {
+        Self {
+            address: path.address.to_vec(),
+            path: path.path,
+        }
     }
 }

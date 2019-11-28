@@ -38,7 +38,7 @@ impl Command for AccountCommandCreate {
     }
     fn execute(&self, client: &mut ClientProxy, _params: &[&str]) {
         println!(">> Creating/retrieving next account from wallet");
-        match client.create_next_account() {
+        match client.create_next_account(true) {
             Ok(account_data) => println!(
                 "Created/retrieved account #{} address {}",
                 account_data.index,
@@ -132,6 +132,7 @@ impl Command for AccountCommandMint {
     fn execute(&self, client: &mut ClientProxy, params: &[&str]) {
         if params.len() != 3 {
             println!("Invalid number of arguments for mint");
+            return;
         }
         println!(">> Minting coins");
         let is_blocking = blocking_cmd(params[0]);

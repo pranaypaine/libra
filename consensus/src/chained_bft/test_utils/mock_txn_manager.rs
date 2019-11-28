@@ -1,9 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::state_replication::{StateComputeResult, TxnManager};
+use crate::state_replication::TxnManager;
+use executor::StateComputeResult;
 use failure::Result;
-use futures::{channel::mpsc, Future, FutureExt, SinkExt};
+use futures::{channel::mpsc, future, Future, FutureExt, SinkExt};
 use std::{
     pin::Pin,
     sync::{
@@ -59,7 +60,7 @@ impl TxnManager for MockTransactionManager {
         let upper_bound = next_value + max_size as usize;
         let res = (next_value..upper_bound).collect();
         self.next_val.store(upper_bound, Ordering::SeqCst);
-        async move { Ok(res) }.boxed()
+        future::ok(res).boxed()
     }
 
     fn commit_txns<'a>(
@@ -74,8 +75,9 @@ impl TxnManager for MockTransactionManager {
             for txn in committed_tns {
                 self.committed_txns.write().unwrap().push(txn);
             }
+            let len = self.committed_txns.read().unwrap().len();
             commit_sender
-                .send(self.committed_txns.read().unwrap().len())
+                .send(len)
                 .await
                 .expect("Failed to notify about mempool commit");
             Ok(())

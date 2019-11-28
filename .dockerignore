@@ -1,3 +1,4 @@
-.git/
+*~
 **/.terraform/
 target/
+!target/libra-node-builder/libra-node

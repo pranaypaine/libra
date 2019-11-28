@@ -1,0 +1,16 @@
+import 0x0.LibraAccount;
+import 0x0.LibraCoin;
+main() {
+    let handle: LibraAccount.EventHandle<LibraCoin.T>;
+    let zero: LibraCoin.T;
+    handle = LibraAccount.new_event_handle<LibraCoin.T>();
+    zero = LibraCoin.zero();
+    LibraAccount.emit_event<LibraCoin.T>(&mut handle, move(zero));
+    LibraAccount.destroy_handle<LibraCoin.T>(move(handle));
+    return;
+}
+
+// check: CONTRAINT_KIND_MISMATCH
+// check: CONTRAINT_KIND_MISMATCH
+// check: CONTRAINT_KIND_MISMATCH
+// check: CONTRAINT_KIND_MISMATCH

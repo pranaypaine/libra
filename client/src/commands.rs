@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account_commands::AccountCommand, client_proxy::ClientProxy, query_commands::QueryCommand,
-    transfer_commands::TransferCommand,
+    account_commands::AccountCommand, client_proxy::ClientProxy, dev_commands::DevCommand,
+    query_commands::QueryCommand, transfer_commands::TransferCommand,
 };
 
 use failure::prelude::*;
-use metrics::counters::*;
+use libra_metrics::counters::*;
+use libra_types::account_address::ADDRESS_LENGTH;
 use std::{collections::HashMap, sync::Arc};
-use types::account_address::ADDRESS_LENGTH;
 
 /// Print the error and bump up error counter.
 pub fn report_error(msg: &str, e: Error) {
@@ -20,13 +20,12 @@ pub fn report_error(msg: &str, e: Error) {
 fn pretty_format_error(e: Error) -> String {
     if let Some(grpc_error) = e.downcast_ref::<grpcio::Error>() {
         if let grpcio::Error::RpcFailure(grpc_rpc_failure) = grpc_error {
-            match grpc_rpc_failure.status {
-                grpcio::RpcStatusCode::Unavailable | grpcio::RpcStatusCode::DeadlineExceeded => {
-                    return "Server unavailable, please retry and/or check \
-                            if host passed to the client is running"
-                        .to_string();
-                }
-                _ => {}
+            if grpc_rpc_failure.status == grpcio::RpcStatusCode::UNAVAILABLE
+                || grpc_rpc_failure.status == grpcio::RpcStatusCode::DEADLINE_EXCEEDED
+            {
+                return "Server unavailable, please retry and/or check \
+                        if host passed to the client is running"
+                    .to_string();
             }
         }
     }
@@ -54,15 +53,20 @@ pub fn is_address(data: &str) -> bool {
 
 /// Returns all the commands available, as well as the reverse index from the aliases to the
 /// commands.
-pub fn get_commands() -> (
+pub fn get_commands(
+    include_dev: bool,
+) -> (
     Vec<Arc<dyn Command>>,
     HashMap<&'static str, Arc<dyn Command>>,
 ) {
-    let commands: Vec<Arc<dyn Command>> = vec![
+    let mut commands: Vec<Arc<dyn Command>> = vec![
         Arc::new(AccountCommand {}),
         Arc::new(QueryCommand {}),
         Arc::new(TransferCommand {}),
     ];
+    if include_dev {
+        commands.push(Arc::new(DevCommand {}));
+    }
     let mut alias_to_cmd = HashMap::new();
     for command in &commands {
         for alias in command.get_aliases() {
@@ -74,8 +78,7 @@ pub fn get_commands() -> (
 
 /// Parse a cmd string, the first element in the returned vector is the command to run
 pub fn parse_cmd(cmd_str: &str) -> Vec<&str> {
-    let input = &cmd_str[..];
-    input.trim().split(' ').map(str::trim).collect()
+    cmd_str.split_ascii_whitespace().collect()
 }
 
 /// Print the help message for all sub commands.

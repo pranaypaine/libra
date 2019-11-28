@@ -17,16 +17,16 @@ use crate::{
     key_factory::{ChildNumber, KeyFactory, Seed},
     mnemonic::Mnemonic,
 };
-use libra_crypto::hash::CryptoHash;
-use proto_conv::{FromProto, IntoProto};
-use protobuf::Message;
+pub use libra_crypto::{
+    ed25519::{Ed25519PublicKey, Ed25519Signature},
+    hash::CryptoHash,
+};
+use libra_types::{
+    account_address::AccountAddress,
+    transaction::{helpers::TransactionSigner, RawTransaction, SignedTransaction},
+};
 use rand::{rngs::EntropyRng, Rng};
 use std::{collections::HashMap, path::Path};
-use types::{
-    account_address::AccountAddress,
-    proto::transaction::SignedTransaction as ProtoSignedTransaction,
-    transaction::{RawTransaction, RawTransactionBytes, SignedTransaction},
-};
 
 /// WalletLibrary contains all the information needed to recreate a particular wallet
 pub struct WalletLibrary {
@@ -111,13 +111,14 @@ impl WalletLibrary {
     pub fn new_address(&mut self) -> Result<(AccountAddress, ChildNumber)> {
         let child = self.key_factory.private_child(self.key_leaf)?;
         let address = child.get_address()?;
-        let child = self.key_leaf;
+        let old_key_leaf = self.key_leaf;
         self.key_leaf.increment();
-        match self.addr_map.insert(address, child) {
-            Some(_) => Err(WalletError::LibraWalletGeneric(
+        if self.addr_map.insert(address, old_key_leaf).is_none() {
+            Ok((address, old_key_leaf))
+        } else {
+            Err(WalletError::LibraWalletGeneric(
                 "This address is already in your wallet".to_string(),
-            )),
-            None => Ok((address, child)),
+            ))
         }
     }
 
@@ -152,23 +153,24 @@ impl WalletLibrary {
     /// AccountAddress is not contained in the addr_map, then this function will return an Error
     pub fn sign_txn(&self, txn: RawTransaction) -> Result<SignedTransaction> {
         if let Some(child) = self.addr_map.get(&txn.sender()) {
-            let raw_bytes = txn.into_proto().write_to_bytes()?;
-            let txn_hashvalue = RawTransactionBytes(&raw_bytes).hash();
-
             let child_key = self.key_factory.private_child(child.clone())?;
-            let signature = child_key.sign(txn_hashvalue);
-            let public_key = child_key.get_public();
-
-            let mut signed_txn = ProtoSignedTransaction::new();
-            signed_txn.set_raw_txn_bytes(raw_bytes.to_vec());
-            signed_txn.set_sender_public_key(public_key.to_bytes().to_vec());
-            signed_txn.set_sender_signature(signature.to_bytes().to_vec());
-
-            Ok(SignedTransaction::from_proto(signed_txn)?)
+            let signature = child_key.sign(txn.hash());
+            Ok(SignedTransaction::new(
+                txn,
+                child_key.get_public(),
+                signature,
+            ))
         } else {
             Err(WalletError::LibraWalletGeneric(
                 "Well, that address is nowhere to be found... This is awkward".to_string(),
             ))
         }
+    }
+}
+
+/// WalletLibrary naturally support TransactionSigner trait.
+impl TransactionSigner for WalletLibrary {
+    fn sign_txn(&self, raw_txn: RawTransaction) -> failure::prelude::Result<SignedTransaction> {
+        Ok(self.sign_txn(raw_txn)?)
     }
 }

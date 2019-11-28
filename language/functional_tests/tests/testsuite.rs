@@ -1,46 +1,29 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![feature(custom_test_frameworks)]
-#![test_runner(datatest::runner)]
-
 use functional_tests::{
-    checker::{check, Directive},
-    config::{Config, ConfigEntry},
-    errors::*,
+    checker::check,
+    config::global::Config as GlobalConfig,
     evaluator::eval,
+    utils::{build_transactions, split_input},
 };
-
-fn parse_input(input: &str) -> Result<(Config, Vec<Directive>, String)> {
-    let mut config_entries = vec![];
-    let mut directives = vec![];
-    let mut text = vec![];
-
-    for line in input.lines() {
-        if let Some(entry) = ConfigEntry::try_parse(line)? {
-            config_entries.push(entry);
-            continue;
-        }
-        if let Some(directive) = Directive::try_parse(line)? {
-            directives.push(directive);
-            continue;
-        }
-        text.push(line.to_string());
-    }
-
-    let text = text.join("\n");
-    let config = Config::build(&config_entries)?;
-    Ok((config, directives, text))
-}
+use std::{fs::read_to_string, path::Path};
 
 // Runs all tests under the test/testsuite directory.
-#[datatest::files("tests/testsuite", { input in r".*\.mvir" })]
-fn functional_tests(input: &str) -> Result<()> {
-    let (config, directives, text) = parse_input(input)?;
-    let res = eval(&config, &text)?;
-    if let Err(e) = check(&res, &directives) {
-        println!("{:#?}", res);
-        return Err(e);
+fn functional_tests(path: &Path) -> datatest_stable::Result<()> {
+    let input = read_to_string(path)?;
+
+    let (config, directives, transactions) = split_input(&input)?;
+    let config = GlobalConfig::build(&config)?;
+    let transactions = build_transactions(&config, &transactions)?;
+
+    let log = eval(&config, &transactions)?;
+    if let Err(e) = check(&log, &directives) {
+        // TODO: allow the user to select debug/display mode
+        println!("{}", log);
+        return Err(e.into());
     }
     Ok(())
 }
+
+datatest_stable::harness!(functional_tests, "tests/testsuite", r".*\.mvir");

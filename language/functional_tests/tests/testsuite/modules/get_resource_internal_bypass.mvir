@@ -1,20 +1,21 @@
-// check: Unrecognized token
+// check: Invalid token
 
-modules:
 module Token {
     resource T { }
-    public new(): R#Token.T {
+    public new(): Self.T {
         return T{ };
     }
 }
 
-script:
-import Transaction.Token;
+//! new-transaction
+
+import {{default}}.Token;
+
 main() {
     let sender: address;
-    let struct1: &mut R#Token.T;
+    let struct1: &mut Token.T;
 
     sender = get_txn_sender();
-    struct1 = borrow_global<Token.T>(copy(sender));
+    struct1 = borrow_global_mut<Token.T>(copy(sender));
     return;
 }

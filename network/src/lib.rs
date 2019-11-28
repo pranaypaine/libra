@@ -1,15 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// The nightly features that are commonly needed with async / await
-// Lets turn these on so that we can experiment a little bit
-#![feature(async_await)]
 // <Black magic>
 // Increase recursion limit to allow for use of select! macro.
 #![recursion_limit = "1024"]
 // </Black magic>
 
 // Public exports
+#[macro_use]
+extern crate prometheus;
+
 pub use common::NetworkPublicKeys;
 pub use interface::NetworkProvider;
 
@@ -28,4 +28,4 @@ mod transport;
 mod utils;
 
 /// Type for unique identifier associated with each network protocol
-pub type ProtocolId = bytes::Bytes;
+pub type ProtocolId = bytes05::Bytes;

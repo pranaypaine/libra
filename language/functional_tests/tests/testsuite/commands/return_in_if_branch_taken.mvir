@@ -1,4 +1,3 @@
-modules:
 module Test {
     public t(): u64 {
         let x: u64;
@@ -11,12 +10,13 @@ module Test {
     }
 }
 
-script:
-import Transaction.Test;
+//! new-transaction
+
+import {{default}}.Test;
+
 main() {
     let x: u64;
     x = Test.t();
     assert(copy(x) == 100, 42);
     return;
 }
-

@@ -6,7 +6,7 @@
 *.md text
 *.proto text
 *.rs text
-*.sh text eol=lf
+*.sh text
 *.toml text
 *.txt text
 *.yml text

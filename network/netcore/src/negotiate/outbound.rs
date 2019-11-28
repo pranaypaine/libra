@@ -25,7 +25,7 @@ where
     write_u16frame(&mut stream, PROTOCOL_INTERACTIVE).await?;
 
     let mut buf = BytesMut::new();
-    let mut recieved_header_ack = false;
+    let mut received_header_ack = false;
     for proto in supported_protocols.as_ref() {
         write_u16frame(&mut stream, proto.as_ref()).await?;
         stream.flush().await?;
@@ -34,7 +34,7 @@ where
         // Note that we do this after sending the first protocol id, allowing for the negotiation to
         // happen in a single round trip in case the remote node indeed speaks our preferred
         // protocol.
-        if !recieved_header_ack {
+        if !received_header_ack {
             read_u16frame(&mut stream, &mut buf).await?;
             if buf.as_ref() != PROTOCOL_INTERACTIVE {
                 // Remote side doesn't understand us, give up
@@ -44,7 +44,7 @@ where
                 ));
             }
 
-            recieved_header_ack = true;
+            received_header_ack = true;
         }
 
         read_u16frame(&mut stream, &mut buf).await?;
@@ -79,7 +79,7 @@ pub async fn negotiate_outbound_select<TSocket, TProto>(
     protocol: TProto,
 ) -> Result<TSocket>
 where
-    TSocket: AsyncRead + AsyncWrite + Unpin,
+    TSocket: AsyncWrite + Unpin,
     TProto: AsRef<[u8]> + Clone,
 {
     write_u16frame(&mut stream, PROTOCOL_SELECT).await?;

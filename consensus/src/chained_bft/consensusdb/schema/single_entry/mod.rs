@@ -31,10 +31,10 @@ define_schema!(
 #[derive(Debug, Eq, PartialEq, FromPrimitive, ToPrimitive)]
 #[repr(u8)]
 pub enum SingleEntryKey {
-    // Used to store ConsensusState
-    ConsensusState = 0,
-    // Used to store the highest timeout certificates
-    HighestTimeoutCertificates = 1,
+    // Used to store the highest timeout certificate
+    HighestTimeoutCertificate = 0,
+    // Used to store the last vote
+    LastVoteMsg = 1,
 }
 
 impl KeyCodec<SingleEntrySchema> for SingleEntryKey {

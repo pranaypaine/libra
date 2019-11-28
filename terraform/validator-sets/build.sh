@@ -1,20 +1,34 @@
 #!/bin/sh
+# Copyright (c) The Libra Core Contributors
+# SPDX-License-Identifier: Apache-2.0
 set -e
 
-OUTDIR="${1?[Specify relative output directory]}"
+OUT_DIR="${1?[Specify relative output directory]}"
 shift
 
-mkdir -p "$OUTDIR"
+LIBRA_DIR="$(cd "$( dirname "${BASH_SOURCE[0]}" )" && cd ../.. && pwd)"
+TF_WORK_DIR="$LIBRA_DIR/terraform/validator-sets"
+OUTPUT_DIR="$TF_WORK_DIR/$OUT_DIR"
+mkdir -p "$OUTPUT_DIR"
 
-cd ../..
 
-if [ ! -e "../setup_scripts/terraform/testnet/validator-sets/$OUTDIR/mint.key" ]; then
-    cargo run --bin generate_keypair -- -o "../setup_scripts/terraform/testnet/validator-sets/$OUTDIR/mint.key"
+if [ ! -e "$OUTPUT_DIR/mint.key" ]; then
+	cargo run -p generate-keypair --bin generate-keypair -- -o "$OUTPUT_DIR/mint.key"
 fi
 
-cargo run --bin libra-config -- -b config/data/configs/node.config.toml -m "../setup_scripts/terraform/testnet/validator-sets/$OUTDIR/mint.key" -o "../setup_scripts/terraform/testnet/validator-sets/$OUTDIR" -d "$@" # -r config/data/configs/overrides/testnet.node.config.override.toml
+cd $LIBRA_DIR && cargo run -p config-builder --bin libra-config -- -m "$OUTPUT_DIR/mint.key" -o "$OUTPUT_DIR/val" -d -r validator "$@"
+cd $LIBRA_DIR && cargo run -p config-builder --bin libra-config -- -m "$OUTPUT_DIR/mint.key" -o "$OUTPUT_DIR/fn" -u "$OUTPUT_DIR/val/0" -r full_node -n 10
 
-cd -
-cd $OUTDIR
-ls *.node.config.toml | head -n1 | xargs -I{} mv {} node.config.toml
-rm *.node.config.toml
+cd "$OUTPUT_DIR/val"
+mv */*.keys.toml .
+mv 1/*.network_peers.config.toml network_peers.config.toml
+mv 1/consensus_peers.config.toml ../consensus_peers.config.toml
+mv 1/genesis.blob ../
+rm */*.toml */*.blob
+find . -mindepth 1 -type d -print0 | xargs -0 rmdir
+
+cd "$OUTPUT_DIR/fn"
+mv */*.keys.toml .
+mv 0/*.network_peers.config.toml network_peers.config.toml
+rm */*.toml */*.blob
+find . -mindepth 1 -type d -print0 | xargs -0 rmdir

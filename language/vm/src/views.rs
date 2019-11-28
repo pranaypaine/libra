@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! An alternate representation of the file format built on top of the existing format.
 //!
 //! Some general notes:
@@ -16,15 +18,18 @@ use std::iter::DoubleEndedIterator;
 use crate::{
     access::ModuleAccess,
     file_format::{
-        CodeUnit, FieldDefinition, FunctionDefinition, FunctionHandle, FunctionSignature,
-        LocalIndex, LocalsSignature, ModuleHandle, SignatureToken, StructDefinition, StructHandle,
+        CodeUnit, CompiledModule, FieldDefinition, FunctionDefinition, FunctionHandle,
+        FunctionSignature, Kind, LocalIndex, LocalsSignature, ModuleHandle, SignatureToken,
+        StructDefinition, StructDefinitionIndex, StructFieldInformation, StructHandle,
         StructHandleIndex, TypeSignature,
     },
     SignatureTokenKind,
 };
+use std::collections::BTreeSet;
 
-use types::language_storage::CodeKey;
+use libra_types::language_storage::ModuleId;
 
+use libra_types::identifier::IdentStr;
 use std::collections::BTreeMap;
 
 /// Represents a lazily evaluated abstraction over a module.
@@ -32,8 +37,8 @@ use std::collections::BTreeMap;
 /// `T` here is any sort of `ModuleAccess`. See the documentation in access.rs for more.
 pub struct ModuleView<'a, T> {
     module: &'a T,
-    name_to_function_definition_view: BTreeMap<&'a str, FunctionDefinitionView<'a, T>>,
-    name_to_struct_definition_view: BTreeMap<&'a str, StructDefinitionView<'a, T>>,
+    name_to_function_definition_view: BTreeMap<&'a IdentStr, FunctionDefinitionView<'a, T>>,
+    name_to_struct_definition_view: BTreeMap<&'a IdentStr, StructDefinitionView<'a, T>>,
 }
 
 impl<'a, T: ModuleAccess> ModuleView<'a, T> {
@@ -61,6 +66,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .module_handles()
+            .iter()
             .map(move |module_handle| ModuleHandleView::new(module, module_handle))
     }
 
@@ -70,6 +76,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .struct_handles()
+            .iter()
             .map(move |struct_handle| StructHandleView::new(module, struct_handle))
     }
 
@@ -79,6 +86,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .function_handles()
+            .iter()
             .map(move |function_handle| FunctionHandleView::new(module, function_handle))
     }
 
@@ -86,6 +94,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .struct_defs()
+            .iter()
             .map(move |struct_def| StructDefinitionView::new(module, struct_def))
     }
 
@@ -93,6 +102,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .field_defs()
+            .iter()
             .map(move |field_def| FieldDefinitionView::new(module, field_def))
     }
 
@@ -102,6 +112,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .function_defs()
+            .iter()
             .map(move |function_def| FunctionDefinitionView::new(module, function_def))
     }
 
@@ -111,6 +122,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .type_signatures()
+            .iter()
             .map(move |type_signature| TypeSignatureView::new(module, type_signature))
     }
 
@@ -120,6 +132,7 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .function_signatures()
+            .iter()
             .map(move |function_signature| FunctionSignatureView::new(module, function_signature))
     }
 
@@ -129,15 +142,42 @@ impl<'a, T: ModuleAccess> ModuleView<'a, T> {
         let module = self.module;
         module
             .locals_signatures()
+            .iter()
             .map(move |locals_signature| LocalsSignatureView::new(module, locals_signature))
     }
 
-    pub fn function_definition(&self, name: &'a str) -> Option<&FunctionDefinitionView<'a, T>> {
+    pub fn function_definition(
+        &self,
+        name: &'a IdentStr,
+    ) -> Option<&FunctionDefinitionView<'a, T>> {
         self.name_to_function_definition_view.get(name)
     }
 
-    pub fn struct_definition(&self, name: &'a str) -> Option<&StructDefinitionView<'a, T>> {
+    pub fn struct_definition(&self, name: &'a IdentStr) -> Option<&StructDefinitionView<'a, T>> {
         self.name_to_struct_definition_view.get(name)
+    }
+
+    pub fn function_acquired_resources(
+        &self,
+        function_handle: &FunctionHandle,
+    ) -> BTreeSet<StructDefinitionIndex> {
+        if function_handle.module.0 != CompiledModule::IMPLEMENTED_MODULE_INDEX {
+            return BTreeSet::new();
+        }
+
+        // TODO these unwraps should be VMInvariantViolations
+        let function_name = self.as_inner().identifier_at(function_handle.name);
+        let function_def = self.function_definition(function_name).unwrap();
+        function_def
+            .as_inner()
+            .acquires_global_resources
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn id(&self) -> ModuleId {
+        self.module.self_id()
     }
 }
 
@@ -154,8 +194,8 @@ impl<'a, T: ModuleAccess> ModuleHandleView<'a, T> {
         }
     }
 
-    pub fn module_code_key(&self) -> CodeKey {
-        self.module.code_key_for_handle(self.module_handle)
+    pub fn module_id(&self) -> ModuleId {
+        self.module.module_id_for_handle(self.module_handle)
     }
 }
 
@@ -172,24 +212,24 @@ impl<'a, T: ModuleAccess> StructHandleView<'a, T> {
         }
     }
 
-    pub fn is_resource(&self) -> bool {
-        self.struct_handle.is_resource
+    pub fn is_nominal_resource(&self) -> bool {
+        self.struct_handle.is_nominal_resource
     }
 
-    pub fn definition(&self) -> StructDefinitionView<'a, T> {
-        unimplemented!("this requires linking")
+    pub fn type_formals(&self) -> &Vec<Kind> {
+        &self.struct_handle.type_formals
     }
 
     pub fn module_handle(&self) -> &ModuleHandle {
         self.module.module_handle_at(self.struct_handle.module)
     }
 
-    pub fn name(&self) -> &'a str {
-        self.module.string_at(self.struct_handle.name)
+    pub fn name(&self) -> &'a IdentStr {
+        self.module.identifier_at(self.struct_handle.name)
     }
 
-    pub fn module_code_key(&self) -> CodeKey {
-        self.module.code_key_for_handle(self.module_handle())
+    pub fn module_id(&self) -> ModuleId {
+        self.module.module_id_for_handle(self.module_handle())
     }
 }
 
@@ -210,8 +250,8 @@ impl<'a, T: ModuleAccess> FunctionHandleView<'a, T> {
         self.module.module_handle_at(self.function_handle.module)
     }
 
-    pub fn name(&self) -> &'a str {
-        self.module.string_at(self.function_handle.name)
+    pub fn name(&self) -> &'a IdentStr {
+        self.module.identifier_at(self.function_handle.name)
     }
 
     pub fn signature(&self) -> FunctionSignatureView<'a, T> {
@@ -221,8 +261,8 @@ impl<'a, T: ModuleAccess> FunctionHandleView<'a, T> {
         FunctionSignatureView::new(self.module, function_signature)
     }
 
-    pub fn module_code_key(&self) -> CodeKey {
-        self.module.code_key_for_handle(self.module_handle())
+    pub fn module_id(&self) -> ModuleId {
+        self.module.module_id_for_handle(self.module_handle())
     }
 }
 
@@ -243,18 +283,40 @@ impl<'a, T: ModuleAccess> StructDefinitionView<'a, T> {
         }
     }
 
-    pub fn is_resource(&self) -> bool {
-        self.struct_handle_view.is_resource()
+    pub fn is_nominal_resource(&self) -> bool {
+        self.struct_handle_view.is_nominal_resource()
     }
 
-    pub fn fields(&self) -> impl DoubleEndedIterator<Item = FieldDefinitionView<'a, T>> + Send {
+    pub fn is_native(&self) -> bool {
+        match &self.struct_def.field_information {
+            StructFieldInformation::Native => true,
+            StructFieldInformation::Declared { .. } => false,
+        }
+    }
+
+    pub fn type_formals(&self) -> &Vec<Kind> {
+        self.struct_handle_view.type_formals()
+    }
+
+    pub fn fields(
+        &self,
+    ) -> Option<impl DoubleEndedIterator<Item = FieldDefinitionView<'a, T>> + Send> {
         let module = self.module;
-        module
-            .field_def_range(self.struct_def.field_count, self.struct_def.fields)
-            .map(move |field_def| FieldDefinitionView::new(module, field_def))
+        match self.struct_def.field_information {
+            StructFieldInformation::Native => None,
+            StructFieldInformation::Declared {
+                field_count,
+                fields,
+            } => Some(
+                module
+                    .field_def_range(field_count, fields)
+                    .iter()
+                    .map(move |field_def| FieldDefinitionView::new(module, field_def)),
+            ),
+        }
     }
 
-    pub fn name(&self) -> &'a str {
+    pub fn name(&self) -> &'a IdentStr {
         self.struct_handle_view.name()
     }
 }
@@ -269,13 +331,17 @@ impl<'a, T: ModuleAccess> FieldDefinitionView<'a, T> {
         Self { module, field_def }
     }
 
-    pub fn name(&self) -> &'a str {
-        self.module.string_at(self.field_def.name)
+    pub fn name(&self) -> &'a IdentStr {
+        self.module.identifier_at(self.field_def.name)
     }
 
     pub fn type_signature(&self) -> TypeSignatureView<'a, T> {
         let type_signature = self.module.type_signature_at(self.field_def.signature);
         TypeSignatureView::new(self.module, type_signature)
+    }
+
+    pub fn signature_token(&self) -> &SignatureToken {
+        &self.module.type_signature_at(self.field_def.signature).0
     }
 
     // Field definitions are always private.
@@ -319,7 +385,7 @@ impl<'a, T: ModuleAccess> FunctionDefinitionView<'a, T> {
         LocalsSignatureView::new(self.module, locals_signature)
     }
 
-    pub fn name(&self) -> &'a str {
+    pub fn name(&self) -> &'a IdentStr {
         self.function_handle_view.name()
     }
 
@@ -352,8 +418,13 @@ impl<'a, T: ModuleAccess> TypeSignatureView<'a, T> {
     }
 
     #[inline]
-    pub fn is_resource(&self) -> bool {
-        self.token().is_resource()
+    pub fn kind(&self, type_formals: &[Kind]) -> Kind {
+        self.token().kind(type_formals)
+    }
+
+    #[inline]
+    pub fn contains_nominal_resource(&self, type_formals: &[Kind]) -> bool {
+        self.token().contains_nominal_resource(type_formals)
     }
 }
 
@@ -454,14 +525,34 @@ impl<'a, T: ModuleAccess> SignatureTokenView<'a, T> {
     }
 
     #[inline]
-    pub fn kind(&self) -> SignatureTokenKind {
-        self.token.kind()
+    pub fn signature_token_kind(&self) -> SignatureTokenKind {
+        self.token.signature_token_kind()
     }
 
-    #[inline]
-    pub fn is_resource(&self) -> bool {
+    // TODO: rework views to make the interfaces here cleaner.
+    pub fn kind(&self, type_formals: &[Kind]) -> Kind {
+        SignatureToken::kind((self.module.struct_handles(), type_formals), self.token)
+    }
+
+    /// Determines if the given signature token contains a nominal resource.
+    /// More specifically, a signature token contains a nominal resource if
+    ///   1) it is a type variable explicitly marked as resource kind.
+    ///   2) it is a struct that
+    ///       a) is marked as resource.
+    ///       b) has a type actual which is a nominal resource.
+    ///
+    /// Similar to `SignatureTokenView::kind`, the context is used for looking up struct
+    /// definitions & type formals.
+    // TODO: refactor views so that we get the type formals from self.
+    pub fn contains_nominal_resource(&self, type_formals: &[Kind]) -> bool {
         match self.token {
-            SignatureToken::Struct(sh_idx) => self.module.struct_handle_at(*sh_idx).is_resource,
+            SignatureToken::Struct(sh_idx, type_arguments) => {
+                StructHandleView::new(self.module, self.module.struct_handle_at(*sh_idx))
+                    .is_nominal_resource()
+                    || type_arguments.iter().any(|token| {
+                        Self::new(self.module, token).contains_nominal_resource(type_formals)
+                    })
+            }
             SignatureToken::Reference(_)
             | SignatureToken::MutableReference(_)
             | SignatureToken::Bool
@@ -469,6 +560,11 @@ impl<'a, T: ModuleAccess> SignatureTokenView<'a, T> {
             | SignatureToken::String
             | SignatureToken::ByteArray
             | SignatureToken::Address => false,
+
+            SignatureToken::TypeParameter(idx) => match type_formals[*idx as usize] {
+                Kind::Resource => true,
+                Kind::All | Kind::Unrestricted => false,
+            },
         }
     }
 

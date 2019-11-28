@@ -1,12 +1,7 @@
-// check: VerificationError { kind: FunctionDefinition, idx: 1, err: DuplicateElement }
+// check: VerificationFailure
+// check: DUPLICATE_ELEMENT
 
-modules:
 module M {
     f() {}
     f() {}
-}
-
-script:
-main() {
-    return;
 }

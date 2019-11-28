@@ -4,12 +4,10 @@
 //! Rpc protocol errors
 
 use crate::peer_manager::PeerManagerError;
-use failure::{self, Fail};
+use failure::Fail;
 use futures::channel::{mpsc, oneshot};
-use protobuf::error::ProtobufError;
+use libra_types::PeerId;
 use std::io;
-use tokio::timer;
-use types::PeerId;
 
 #[derive(Debug, Fail)]
 pub enum RpcError {
@@ -19,8 +17,11 @@ pub enum RpcError {
     #[fail(display = "Failed to open substream, not connected with peer: {}", _0)]
     NotConnected(PeerId),
 
+    #[fail(display = "Error writing protobuf message: {:?}", _0)]
+    ProstEncodeError(#[fail(cause)] prost::EncodeError),
+
     #[fail(display = "Error parsing protobuf message: {:?}", _0)]
-    ProtobufParseError(#[fail(cause)] ProtobufError),
+    ProstDecodeError(#[fail(cause)] prost::DecodeError),
 
     #[fail(display = "Received invalid rpc response message")]
     InvalidRpcResponse,
@@ -42,9 +43,6 @@ pub enum RpcError {
 
     #[fail(display = "Rpc timed out")]
     TimedOut,
-
-    #[fail(display = "Error setting timeout: {:?}", _0)]
-    TimerError(#[fail(cause)] timer::Error),
 }
 
 impl From<io::Error> for RpcError {
@@ -57,14 +55,21 @@ impl From<PeerManagerError> for RpcError {
     fn from(err: PeerManagerError) -> Self {
         match err {
             PeerManagerError::NotConnected(peer_id) => RpcError::NotConnected(peer_id),
-            _ => unreachable!("open_substream only returns NotConnected errors"),
+            PeerManagerError::IoError(err) => RpcError::IoError(err),
+            _ => unreachable!("open_substream only returns NotConnected or IoError"),
         }
     }
 }
 
-impl From<ProtobufError> for RpcError {
-    fn from(err: ProtobufError) -> RpcError {
-        RpcError::ProtobufParseError(err)
+impl From<prost::EncodeError> for RpcError {
+    fn from(err: prost::EncodeError) -> RpcError {
+        RpcError::ProstEncodeError(err)
+    }
+}
+
+impl From<prost::DecodeError> for RpcError {
+    fn from(err: prost::DecodeError) -> RpcError {
+        RpcError::ProstDecodeError(err)
     }
 }
 
@@ -80,16 +85,8 @@ impl From<mpsc::SendError> for RpcError {
     }
 }
 
-impl From<timer::timeout::Error<RpcError>> for RpcError {
-    fn from(err: timer::timeout::Error<RpcError>) -> RpcError {
-        if err.is_elapsed() {
-            RpcError::TimedOut
-        } else if err.is_timer() {
-            RpcError::TimerError(err.into_timer().unwrap())
-        } else if err.is_inner() {
-            err.into_inner().unwrap()
-        } else {
-            unreachable!("tokio timeout Error only has 3 cases; the above if cases are therefore exhaustive.")
-        }
+impl From<tokio::time::Elapsed> for RpcError {
+    fn from(_err: tokio::time::Elapsed) -> RpcError {
+        RpcError::TimedOut
     }
 }

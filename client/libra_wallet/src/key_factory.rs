@@ -16,14 +16,14 @@
 //! Private Keys adheres to [HKDF RFC 5869](https://tools.ietf.org/html/rfc5869).
 
 use byteorder::{ByteOrder, LittleEndian};
-use crypto::{hmac::Hmac as CryptoHmac, pbkdf2::pbkdf2, sha3::Sha3};
-use ed25519_dalek;
-use libra_crypto::{hash::HashValue, hkdf::Hkdf};
+use hmac::Hmac;
+use libra_crypto::{ed25519::*, hash::HashValue, hkdf::Hkdf, traits::SigningKey};
+use libra_types::account_address::AccountAddress;
+use mirai_annotations::*;
+use pbkdf2::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sha3::Sha3_256;
 use std::{convert::TryFrom, ops::AddAssign};
-use tiny_keccak::Keccak;
-use types::account_address::AccountAddress;
 
 use crate::{error::Result, mnemonic::Mnemonic};
 
@@ -36,6 +36,7 @@ impl_array_newtype_encodable!(Master, u8, 32);
 /// A child number for a derived key, used to derive a certain private key from the Master
 #[derive(Default, Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ChildNumber(pub(crate) u64);
+// invariant self.0 <= u64::max_value() / 2;
 
 impl ChildNumber {
     /// Constructor from u64
@@ -51,6 +52,8 @@ impl ChildNumber {
 
 impl std::ops::AddAssign for ChildNumber {
     fn add_assign(&mut self, other: Self) {
+        assume!(self.0 <= u64::max_value() / 2); // invariant
+        assume!(other.0 <= u64::max_value() / 2); // invariant
         *self = Self(self.0 + other.0)
     }
 }
@@ -72,14 +75,14 @@ pub struct ExtendedPrivKey {
     /// Child number of the key used to derive from Parent.
     _child_number: ChildNumber,
     /// Private key.
-    private_key: ed25519_dalek::SecretKey,
+    private_key: Ed25519PrivateKey,
 }
 
 impl ExtendedPrivKey {
     /// Constructor for creating an ExtendedPrivKey from a ed25519 PrivateKey. Note that the
     /// ChildNumber are not used in this iteration of LibraWallet, but in order to
     /// enable more general Hierarchical KeyDerivation schemes, we include it for completeness.
-    pub fn new(_child_number: ChildNumber, private_key: ed25519_dalek::SecretKey) -> Self {
+    pub fn new(_child_number: ChildNumber, private_key: Ed25519PrivateKey) -> Self {
         Self {
             _child_number,
             private_key,
@@ -87,7 +90,7 @@ impl ExtendedPrivKey {
     }
 
     /// Returns the PublicKey associated to a particular ExtendedPrivKey
-    pub fn get_public(&self) -> ed25519_dalek::PublicKey {
+    pub fn get_public(&self) -> Ed25519PublicKey {
         (&self.private_key).into()
     }
 
@@ -95,10 +98,7 @@ impl ExtendedPrivKey {
     /// from the raw bytes of the pubkey hash
     pub fn get_address(&self) -> Result<AccountAddress> {
         let public_key = self.get_public();
-        let mut keccak = Keccak::new_sha3_256();
-        let mut hash = [0u8; 32];
-        keccak.update(&public_key.to_bytes());
-        keccak.finalize(&mut hash);
+        let hash = *HashValue::from_sha3_256(&public_key.to_bytes()).as_ref();
         let addr = AccountAddress::try_from(&hash[..])?;
         Ok(addr)
     }
@@ -110,11 +110,8 @@ impl ExtendedPrivKey {
     /// In other words: In Libra, the message used for signature and verification is the sha3 hash
     /// of the transaction. This sha3 hash is then hashed again using SHA512 to arrive at the
     /// deterministic nonce for the EdDSA.
-    pub fn sign(&self, msg: HashValue) -> ed25519_dalek::Signature {
-        let public_key: ed25519_dalek::PublicKey = (&self.private_key).into();
-        let expanded_secret_key: ed25519_dalek::ExpandedSecretKey =
-            ed25519_dalek::ExpandedSecretKey::from(&self.private_key);
-        expanded_secret_key.sign(msg.as_ref(), &public_key)
+    pub fn sign(&self, msg: HashValue) -> Ed25519Signature {
+        self.private_key.sign_message(&msg)
     }
 }
 
@@ -153,7 +150,8 @@ impl KeyFactory {
         info.extend_from_slice(&le_n);
 
         let hkdf_expand = Hkdf::<Sha3_256>::expand(&self.master(), Some(&info), 32)?;
-        let sk = ed25519_dalek::SecretKey::from_bytes(&hkdf_expand)?;
+        let sk = Ed25519PrivateKey::try_from(hkdf_expand.as_slice())
+            .expect("Unable to convert into private key");
 
         Ok(ExtendedPrivKey::new(child, sk))
     }
@@ -174,22 +172,23 @@ impl Seed {
     /// particular Mnemonic and salt. WalletLibrary implements a fixed salt, but a user could
     /// choose a user-defined salt instead of the hardcoded one.
     pub fn new(mnemonic: &Mnemonic, salt: &str) -> Seed {
-        let mut mac = CryptoHmac::new(Sha3::sha3_256(), mnemonic.to_string().as_bytes());
         let mut output = [0u8; 32];
 
         let mut msalt = KeyFactory::MNEMONIC_SALT_PREFIX.to_vec();
         msalt.extend_from_slice(salt.as_bytes());
 
-        pbkdf2(&mut mac, &msalt, 2048, &mut output);
+        pbkdf2::<Hmac<Sha3_256>>(mnemonic.to_string().as_ref(), &msalt, 2048, &mut output);
         Seed(output)
     }
 }
 
+#[cfg(test)]
 #[test]
 fn assert_default_child_number() {
     assert_eq!(ChildNumber::default(), ChildNumber(0));
 }
 
+#[cfg(test)]
 #[test]
 fn test_key_derivation() {
     let data = hex::decode("7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f").unwrap();

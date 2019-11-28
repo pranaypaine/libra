@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! This library implements a schematized DB on top of [RocksDB](https://rocksdb.org/). It makes
 //! sure all data passed in and out are structured according to predefined schemas and prevents
 //! access to raw keys and values. This library also enforces a set of Libra specific DB options,
@@ -16,6 +18,8 @@ pub mod schema;
 
 use crate::schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec};
 use failure::prelude::*;
+use lazy_static::lazy_static;
+use libra_metrics::OpMetrics;
 use rocksdb::{
     rocksdb_options::ColumnFamilyDescriptor, CFHandle, DBOptions, Writable, WriteOptions,
 };
@@ -25,6 +29,10 @@ use std::{
     marker::PhantomData,
     path::Path,
 };
+
+lazy_static! {
+    static ref OP_COUNTER: OpMetrics = OpMetrics::new_and_registered("schemadb");
+}
 
 /// Type alias to `rocksdb::ColumnFamilyOptions`. See [`rocksdb doc`](https://github.com/pingcap/rust-rocksdb/blob/master/src/rocksdb_options.rs)
 pub type ColumnFamilyOptions = rocksdb::ColumnFamilyOptions;
@@ -50,7 +58,7 @@ enum WriteOp {
 /// will be applied in the order in which they are added to the `SchemaBatch`.
 #[derive(Debug, Default)]
 pub struct SchemaBatch {
-    rows: Vec<(ColumnFamilyName, Vec<u8> /* key */, WriteOp)>,
+    rows: HashMap<ColumnFamilyName, BTreeMap<Vec<u8>, WriteOp>>,
 }
 
 impl SchemaBatch {
@@ -64,7 +72,10 @@ impl SchemaBatch {
         let key = <S::Key as KeyCodec<S>>::encode_key(key)?;
         let value = <S::Value as ValueCodec<S>>::encode_value(value)?;
         self.rows
-            .push((S::COLUMN_FAMILY_NAME, key, WriteOp::Value(value)));
+            .entry(S::COLUMN_FAMILY_NAME)
+            .or_insert_with(BTreeMap::new)
+            .insert(key, WriteOp::Value(value));
+
         Ok(())
     }
 
@@ -72,7 +83,10 @@ impl SchemaBatch {
     pub fn delete<S: Schema>(&mut self, key: &S::Key) -> Result<()> {
         let key = <S::Key as KeyCodec<S>>::encode_key(key)?;
         self.rows
-            .push((S::COLUMN_FAMILY_NAME, key, WriteOp::Deletion));
+            .entry(S::COLUMN_FAMILY_NAME)
+            .or_insert_with(BTreeMap::new)
+            .insert(key, WriteOp::Deletion);
+
         Ok(())
     }
 }
@@ -226,10 +240,14 @@ impl DB {
     pub fn get<S: Schema>(&self, schema_key: &S::Key) -> Result<Option<S::Value>> {
         let k = <S::Key as KeyCodec<S>>::encode_key(&schema_key)?;
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+        let time = std::time::Instant::now();
 
-        self.inner
+        let result = self
+            .inner
             .get_cf(cf_handle, &k)
-            .map_err(convert_rocksdb_err)?
+            .map_err(convert_rocksdb_err)?;
+        OP_COUNTER.observe_duration(&format!("db_get_{}", S::COLUMN_FAMILY_NAME), time.elapsed());
+        result
             .map(|raw_value| <S::Value as ValueCodec<S>>::decode_value(&raw_value))
             .transpose()
     }
@@ -245,6 +263,24 @@ impl DB {
             .map_err(convert_rocksdb_err)
     }
 
+    /// Delete all keys in range [begin, end).
+    ///
+    /// `SK` has to be an explict type parameter since
+    /// https://github.com/rust-lang/rust/issues/44721
+    pub fn range_delete<S, SK>(&self, begin: &SK, end: &SK) -> Result<()>
+    where
+        S: Schema,
+        SK: SeekKeyCodec<S>,
+    {
+        let raw_begin = begin.encode_seek_key()?;
+        let raw_end = end.encode_seek_key()?;
+        let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
+
+        self.inner
+            .delete_range_cf(&cf_handle, &raw_begin, &raw_end)
+            .map_err(convert_rocksdb_err)
+    }
+
     /// Returns a [`SchemaIterator`] on a certain schema.
     pub fn iter<S: Schema>(&self, opts: ReadOptions) -> Result<SchemaIterator<S>> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
@@ -254,18 +290,35 @@ impl DB {
     /// Writes a group of records wrapped in a [`SchemaBatch`].
     pub fn write_schemas(&self, batch: SchemaBatch) -> Result<()> {
         let db_batch = rocksdb::WriteBatch::new();
-        for (cf_name, key, write_op) in &batch.rows {
+        for (cf_name, rows) in &batch.rows {
             let cf_handle = self.get_cf_handle(cf_name)?;
-            match write_op {
-                WriteOp::Value(value) => db_batch.put_cf(cf_handle, &key, &value),
-                WriteOp::Deletion => db_batch.delete_cf(cf_handle, &key),
+            for (key, write_op) in rows {
+                match write_op {
+                    WriteOp::Value(value) => db_batch.put_cf(cf_handle, key, value),
+                    WriteOp::Deletion => db_batch.delete_cf(cf_handle, key),
+                }
+                .map_err(convert_rocksdb_err)?;
             }
-            .map_err(convert_rocksdb_err)?;
         }
 
         self.inner
             .write_opt(&db_batch, &default_write_options())
-            .map_err(convert_rocksdb_err)
+            .map_err(convert_rocksdb_err)?;
+
+        // Bump counters only after DB write succeeds.
+        for (cf_name, rows) in &batch.rows {
+            for (key, write_op) in rows {
+                match write_op {
+                    WriteOp::Value(value) => OP_COUNTER.observe(
+                        &format!("db_put_bytes_{}", cf_name),
+                        (key.len() + value.len()) as f64,
+                    ),
+                    WriteOp::Deletion => OP_COUNTER.inc(&format!("db_delete_{}", cf_name)),
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn get_cf_handle(&self, cf_name: &str) -> Result<&CFHandle> {

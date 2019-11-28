@@ -3,33 +3,32 @@
 
 use crate::AccountData;
 use admission_control_proto::{
-    proto::{
-        admission_control::{
-            SubmitTransactionRequest, SubmitTransactionResponse as ProtoSubmitTransactionResponse,
-        },
-        admission_control_grpc::AdmissionControlClient,
+    proto::admission_control::{
+        AdmissionControlClient, SubmitTransactionRequest,
+        SubmitTransactionResponse as ProtoSubmitTransactionResponse,
     },
     AdmissionControlStatus, SubmitTransactionResponse,
 };
 use failure::prelude::*;
 use futures::Future;
 use grpcio::{CallOption, ChannelBuilder, EnvBuilder};
-use logger::prelude::*;
-use proto_conv::{FromProto, IntoProto};
-use std::sync::Arc;
-use types::{
+use libra_crypto::ed25519::*;
+use libra_logger::prelude::*;
+use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_config::get_account_resource_or_default,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::{ContractEvent, EventWithProof},
+    crypto_proxies::ValidatorVerifier,
     get_with_proof::{
         RequestItem, ResponseItem, UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse,
     },
-    transaction::{SignedTransaction, Version},
-    validator_verifier::ValidatorVerifier,
-    vm_error::{VMStatus, VMValidationStatus},
+    transaction::{Transaction, Version},
+    vm_error::StatusCode,
 };
+use std::convert::TryFrom;
+use std::sync::Arc;
 
 const MAX_GRPC_RETRY_COUNT: u64 = 1;
 
@@ -41,7 +40,7 @@ pub struct GRPCClient {
 
 impl GRPCClient {
     /// Construct a new Client instance.
-    pub fn new(host: &str, port: &str, validator_verifier: Arc<ValidatorVerifier>) -> Result<Self> {
+    pub fn new(host: &str, port: u16, validator_verifier: Arc<ValidatorVerifier>) -> Result<Self> {
         let conn_addr = format!("{}:{}", host, port);
 
         // Create a GRPC client
@@ -55,10 +54,11 @@ impl GRPCClient {
         })
     }
 
-    /// Submits a transaction and bumps the sequence number for the sender
+    /// Submits a transaction and bumps the sequence number for the sender, pass in `None` for
+    /// sender_account if sender's address is not managed by the client.
     pub fn submit_transaction(
         &self,
-        sender_account: &mut AccountData,
+        sender_account_opt: Option<&mut AccountData>,
         req: &SubmitTransactionRequest,
     ) -> Result<()> {
         let mut resp = self.submit_transaction_opt(req);
@@ -68,23 +68,27 @@ impl GRPCClient {
             resp = self.submit_transaction_opt(&req);
         }
 
-        let completed_resp = SubmitTransactionResponse::from_proto(resp?)?;
+        let completed_resp = SubmitTransactionResponse::try_from(resp?)?;
 
         if let Some(ac_status) = completed_resp.ac_status {
             if ac_status == AdmissionControlStatus::Accepted {
-                // Bump up sequence_number if transaction is accepted.
-                sender_account.sequence_number += 1;
+                if let Some(sender_account) = sender_account_opt {
+                    // Bump up sequence_number if transaction is accepted.
+                    sender_account.sequence_number += 1;
+                }
             } else {
                 bail!("Transaction failed with AC status: {:?}", ac_status,);
             }
         } else if let Some(vm_error) = completed_resp.vm_error {
-            if vm_error == VMStatus::Validation(VMValidationStatus::SequenceNumberTooOld) {
-                sender_account.sequence_number =
-                    self.get_sequence_number(sender_account.address)?;
-                bail!(
-                    "Transaction failed with vm status: {:?}, please retry your transaction.",
-                    vm_error
-                );
+            if vm_error.major_status == StatusCode::SEQUENCE_NUMBER_TOO_OLD {
+                if let Some(sender_account) = sender_account_opt {
+                    sender_account.sequence_number =
+                        self.get_sequence_number(sender_account.address)?;
+                    bail!(
+                        "Transaction failed with vm status: {:?}, please retry your transaction.",
+                        vm_error
+                    );
+                }
             }
             bail!("Transaction failed with vm status: {:?}", vm_error);
         } else if let Some(mempool_error) = completed_resp.mempool_error {
@@ -110,7 +114,7 @@ impl GRPCClient {
             .client
             .submit_transaction_async_opt(&req, Self::get_default_grpc_call_option())?
             .then(|proto_resp| {
-                let ret = SubmitTransactionResponse::from_proto(proto_resp?)?;
+                let ret = SubmitTransactionResponse::try_from(proto_resp?)?;
                 Ok(ret)
             });
         Ok(resp)
@@ -128,11 +132,13 @@ impl GRPCClient {
     fn get_with_proof_async(
         &self,
         requested_items: Vec<RequestItem>,
-    ) -> Result<impl Future<Item = UpdateToLatestLedgerResponse, Error = failure::Error>> {
+    ) -> Result<
+        impl Future<Item = UpdateToLatestLedgerResponse<Ed25519Signature>, Error = failure::Error>,
+    > {
         let req = UpdateToLatestLedgerRequest::new(0, requested_items.clone());
         debug!("get_with_proof with request: {:?}", req);
-        let proto_req = req.clone().into_proto();
-        let arc_validator_verifier: Arc<ValidatorVerifier> = Arc::clone(&self.validator_verifier);
+        let proto_req = req.clone().into();
+        let validator_verifier = Arc::clone(&self.validator_verifier);
         let ret = self
             .client
             .update_to_latest_ledger_async_opt(&proto_req, Self::get_default_grpc_call_option())?
@@ -140,8 +146,8 @@ impl GRPCClient {
                 // TODO: Cache/persist client_known_version to work with validator set change when
                 // the feature is available.
 
-                let resp = UpdateToLatestLedgerResponse::from_proto(get_with_proof_resp?)?;
-                resp.verify(arc_validator_verifier, &req)?;
+                let resp = UpdateToLatestLedgerResponse::try_from(get_with_proof_resp?)?;
+                resp.verify(validator_verifier, &req)?;
                 Ok(resp)
             });
         Ok(ret)
@@ -155,7 +161,7 @@ impl GRPCClient {
                     if let grpcio::Error::RpcFailure(grpc_rpc_failure) = grpc_error {
                         // Only retry when the connection is down to make sure we won't
                         // send one txn twice.
-                        return grpc_rpc_failure.status == grpcio::RpcStatusCode::Unavailable;
+                        return grpc_rpc_failure.status == grpcio::RpcStatusCode::UNAVAILABLE;
                     }
                 }
             }
@@ -166,8 +172,8 @@ impl GRPCClient {
     pub(crate) fn get_with_proof_sync(
         &self,
         requested_items: Vec<RequestItem>,
-    ) -> Result<UpdateToLatestLedgerResponse> {
-        let mut resp: Result<UpdateToLatestLedgerResponse> =
+    ) -> Result<UpdateToLatestLedgerResponse<Ed25519Signature>> {
+        let mut resp: Result<UpdateToLatestLedgerResponse<Ed25519Signature>> =
             self.get_with_proof_async(requested_items.clone())?.wait();
         let mut try_cnt = 0_u64;
 
@@ -208,7 +214,7 @@ impl GRPCClient {
         account: AccountAddress,
         sequence_number: u64,
         fetch_events: bool,
-    ) -> Result<Option<(SignedTransaction, Option<Vec<ContractEvent>>)>> {
+    ) -> Result<Option<(Transaction, Option<Vec<ContractEvent>>)>> {
         let req_item = RequestItem::GetAccountTransactionBySequenceNumber {
             account,
             sequence_number,
@@ -216,12 +222,12 @@ impl GRPCClient {
         };
 
         let mut response = self.get_with_proof_sync(vec![req_item])?;
-        let (signed_txn_with_proof, _) = response
+        let (txn_with_proof, _) = response
             .response_items
             .remove(0)
             .into_get_account_txn_by_seq_num_response()?;
 
-        Ok(signed_txn_with_proof.map(|t| (t.signed_transaction, t.events)))
+        Ok(txn_with_proof.map(|t| (t.transaction, t.events)))
     }
 
     /// Get transactions in range (start_version..start_version + limit - 1) from validator.
@@ -230,7 +236,7 @@ impl GRPCClient {
         start_version: u64,
         limit: u64,
         fetch_events: bool,
-    ) -> Result<Vec<(SignedTransaction, Option<Vec<ContractEvent>>)>> {
+    ) -> Result<Vec<(Transaction, Option<Vec<ContractEvent>>)>> {
         // Make the request.
         let req_item = RequestItem::GetTransactions {
             start_version,
@@ -244,16 +250,13 @@ impl GRPCClient {
             .into_get_transactions_response()?;
 
         // Transform the response.
-        let num_txns = txn_list_with_proof.transaction_and_infos.len();
+        let num_txns = txn_list_with_proof.transactions.len();
         let event_lists = txn_list_with_proof
             .events
             .map(|event_lists| event_lists.into_iter().map(Some).collect())
             .unwrap_or_else(|| vec![None; num_txns]);
 
-        let res = itertools::zip_eq(txn_list_with_proof.transaction_and_infos, event_lists)
-            .map(|((signed_txn, _), events)| (signed_txn, events))
-            .collect();
-        Ok(res)
+        Ok(itertools::zip_eq(txn_list_with_proof.transactions, event_lists).collect())
     }
 
     /// Get event by access path from validator. AccountStateWithProof will be returned if
@@ -265,7 +268,7 @@ impl GRPCClient {
         start_event_seq_num: u64,
         ascending: bool,
         limit: u64,
-    ) -> Result<(Vec<EventWithProof>, Option<AccountStateWithProof>)> {
+    ) -> Result<(Vec<EventWithProof>, AccountStateWithProof)> {
         let req_item = RequestItem::GetEventsByEventAccessPath {
             access_path,
             start_event_seq_num,

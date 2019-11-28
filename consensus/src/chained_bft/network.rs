@@ -1,242 +1,118 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    chained_bft::{
-        block_storage::BlockRetrievalFailure,
-        common::{Author, Payload},
-        consensus_types::{block::Block, quorum_cert::QuorumCert},
-        liveness::{
-            new_round_msg::NewRoundMsg,
-            proposer_election::{ProposalInfo, ProposerInfo},
-        },
-        safety::vote_msg::VoteMsg,
-    },
-    counters,
-};
+use crate::counters;
 use bytes::Bytes;
-use channel;
-use crypto::HashValue;
-use failure;
-use futures::{
-    channel::oneshot, stream::select, FutureExt, SinkExt, Stream, StreamExt, TryFutureExt,
-    TryStreamExt,
+use channel::{self, libra_channel, message_queues::QueueStyle};
+use consensus_types::block_retrieval::{BlockRetrievalRequest, BlockRetrievalResponse};
+use consensus_types::epoch_retrieval::EpochRetrievalRequest;
+use consensus_types::{
+    common::{Author, Payload},
+    proposal_msg::{ProposalMsg, ProposalUncheckedSignatures},
+    sync_info::SyncInfo,
+    vote_msg::VoteMsg,
 };
-use logger::prelude::*;
+use failure::{self};
+use futures::{channel::oneshot, stream::select, SinkExt, Stream, StreamExt, TryStreamExt};
+use libra_logger::prelude::*;
+use libra_types::account_address::AccountAddress;
+use libra_types::crypto_proxies::ValidatorChangeEventWithProof;
+use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorVerifier};
+use libra_types::proto::types::ValidatorChangeEventWithProof as ValidatorChangeEventWithProofProto;
 use network::{
-    proto::{BlockRetrievalStatus, ConsensusMsg, RequestBlock, RespondBlock, RespondChunk},
+    proto::{
+        ConsensusMsg, ConsensusMsg_oneof, Proposal, RequestBlock, RequestEpoch,
+        SyncInfo as SyncInfoProto, VoteMsg as VoteMsgProto,
+    },
     validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender, Event, RpcError},
 };
-use proto_conv::{FromProto, IntoProto};
-use protobuf::Message;
+use std::cmp::Ordering;
 use std::{
+    convert::{TryFrom, TryInto},
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::runtime::TaskExecutor;
-use types::{transaction::TransactionListWithProof, validator_verifier::ValidatorVerifier};
 
-/// The response sent back from event_processor for the BlockRetrievalRequest.
+/// The block retrieval request is used internally for implementing RPC: the callback is executed
+/// for carrying the response
 #[derive(Debug)]
-pub struct BlockRetrievalResponse<T> {
-    pub status: BlockRetrievalStatus,
-    pub blocks: Vec<Block<T>>,
-}
-
-impl<T: Payload> BlockRetrievalResponse<T> {
-    pub fn verify(&self, mut block_id: HashValue, num_blocks: u64) -> Result<(), failure::Error> {
-        if self.status == BlockRetrievalStatus::SUCCEEDED && self.blocks.len() as u64 != num_blocks
-        {
-            return Err(format_err!(
-                "not enough blocks returned, expect {}, get {}",
-                num_blocks,
-                self.blocks.len(),
-            ));
-        }
-        for block in self.blocks.iter() {
-            if block.id() != block_id {
-                return Err(format_err!(
-                    "blocks doesn't form a chain: expect {}, get {}",
-                    block.id(),
-                    block_id
-                ));
-            }
-            block_id = block.parent_id();
-        }
-        Ok(())
-    }
-}
-
-/// BlockRetrievalRequest carries a block id for the requested block as well as the
-/// oneshot sender to deliver the response.
-pub struct BlockRetrievalRequest<T> {
-    pub block_id: HashValue,
-    pub num_blocks: u64,
-    pub response_sender: oneshot::Sender<BlockRetrievalResponse<T>>,
-}
-
-/// Represents a request to get up to batch_size transactions starting from start_version
-/// with the oneshot sender to deliver the response.
-pub struct ChunkRetrievalRequest {
-    pub start_version: u64,
-    pub target: QuorumCert,
-    pub batch_size: u64,
-    pub response_sender: oneshot::Sender<Result<TransactionListWithProof, failure::Error>>,
+pub struct IncomingBlockRetrievalRequest {
+    pub req: BlockRetrievalRequest,
+    pub response_sender: oneshot::Sender<Result<Bytes, RpcError>>,
 }
 
 /// Just a convenience struct to keep all the network proxy receiving queues in one place.
-/// 1. proposals
-/// 2. votes
-/// 3. block retrieval requests (the request carries a oneshot sender for returning the Block)
-/// 4. pacemaker timeouts
 /// Will be returned by the networking trait upon startup.
-pub struct NetworkReceivers<T, P> {
-    pub proposals: channel::Receiver<ProposalInfo<T, P>>,
-    pub votes: channel::Receiver<VoteMsg>,
-    pub block_retrieval: channel::Receiver<BlockRetrievalRequest<T>>,
-    pub new_rounds: channel::Receiver<NewRoundMsg>,
-    pub chunk_retrieval: channel::Receiver<ChunkRetrievalRequest>,
+pub struct NetworkReceivers<T> {
+    pub proposals: libra_channel::Receiver<AccountAddress, ProposalMsg<T>>,
+    pub votes: libra_channel::Receiver<AccountAddress, VoteMsg>,
+    pub block_retrieval: libra_channel::Receiver<AccountAddress, IncomingBlockRetrievalRequest>,
+    pub sync_info_msgs: libra_channel::Receiver<AccountAddress, (SyncInfo, AccountAddress)>,
+    pub epoch_change: libra_channel::Receiver<AccountAddress, LedgerInfoWithSignatures>,
+    pub different_epoch: libra_channel::Receiver<AccountAddress, (u64, AccountAddress)>,
+    pub epoch_retrieval: libra_channel::Receiver<AccountAddress, (u64, AccountAddress)>,
+}
+
+impl<T> NetworkReceivers<T> {
+    pub fn clear_prev_epoch_msgs(&mut self) {
+        // clear all the channels that are relevant for the previous epoch event processor
+        self.proposals.clear();
+        self.votes.clear();
+        self.block_retrieval.clear();
+        self.sync_info_msgs.clear();
+    }
 }
 
 /// Implements the actual networking support for all consensus messaging.
-pub struct ConsensusNetworkImpl {
+#[derive(Clone)]
+pub struct NetworkSender {
     author: Author,
     network_sender: ConsensusNetworkSender,
-    network_events: Option<ConsensusNetworkEvents>,
     // Self sender and self receivers provide a shortcut for sending the messages to itself.
     // (self sending is not supported by the networking API).
     // Note that we do not support self rpc requests as it might cause infinite recursive calls.
-    self_sender: channel::Sender<Result<Event<ConsensusMsg>, failure::Error>>,
-    self_receiver: Option<channel::Receiver<Result<Event<ConsensusMsg>, failure::Error>>>,
-    peers: Arc<Vec<Author>>,
-    validator: Arc<ValidatorVerifier>,
+    self_sender: channel::Sender<failure::Result<Event<ConsensusMsg>>>,
+    validators: Arc<ValidatorVerifier>,
 }
 
-impl Clone for ConsensusNetworkImpl {
-    fn clone(&self) -> Self {
-        Self {
-            author: self.author,
-            network_sender: self.network_sender.clone(),
-            network_events: None,
-            self_sender: self.self_sender.clone(),
-            self_receiver: None,
-            peers: self.peers.clone(),
-            validator: Arc::clone(&self.validator),
-        }
-    }
-}
-
-impl ConsensusNetworkImpl {
+impl NetworkSender {
     pub fn new(
         author: Author,
         network_sender: ConsensusNetworkSender,
-        network_events: ConsensusNetworkEvents,
-        peers: Arc<Vec<Author>>,
-        validator: Arc<ValidatorVerifier>,
+        self_sender: channel::Sender<failure::Result<Event<ConsensusMsg>>>,
+        validators: Arc<ValidatorVerifier>,
     ) -> Self {
-        let (self_sender, self_receiver) = channel::new(1_024, &counters::PENDING_SELF_MESSAGES);
-        ConsensusNetworkImpl {
+        NetworkSender {
             author,
             network_sender,
-            network_events: Some(network_events),
             self_sender,
-            self_receiver: Some(self_receiver),
-            peers,
-            validator,
-        }
-    }
-
-    /// Establishes the initial connections with the peers and returns the receivers.
-    pub fn start<T: Payload, P: ProposerInfo>(
-        &mut self,
-        executor: &TaskExecutor,
-    ) -> NetworkReceivers<T, P> {
-        let (proposal_tx, proposal_rx) = channel::new(1_024, &counters::PENDING_PROPOSAL);
-        let (vote_tx, vote_rx) = channel::new(1_024, &counters::PENDING_VOTES);
-        let (block_request_tx, block_request_rx) =
-            channel::new(1_024, &counters::PENDING_BLOCK_REQUESTS);
-        let (chunk_request_tx, chunk_request_rx) =
-            channel::new(1_024, &counters::PENDING_CHUNK_REQUESTS);
-        let (new_round_tx, new_round_rx) =
-            channel::new(1_024, &counters::PENDING_NEW_ROUND_MESSAGES);
-        let network_events = self
-            .network_events
-            .take()
-            .expect("[consensus] Failed to start; network_events stream is already taken")
-            .map_err(Into::<failure::Error>::into);
-        let own_msgs = self
-            .self_receiver
-            .take()
-            .expect("[consensus]: self receiver is already taken");
-        let all_events = select(network_events, own_msgs);
-        let validator = Arc::clone(&self.validator);
-        executor.spawn(
-            NetworkTask {
-                proposal_tx,
-                vote_tx,
-                block_request_tx,
-                chunk_request_tx,
-                new_round_tx,
-                all_events,
-                validator,
-            }
-            .run()
-            .boxed()
-            .unit_error()
-            .compat(),
-        );
-        NetworkReceivers {
-            proposals: proposal_rx,
-            votes: vote_rx,
-            block_retrieval: block_request_rx,
-            new_rounds: new_round_rx,
-            chunk_retrieval: chunk_request_rx,
+            validators,
         }
     }
 
     /// Tries to retrieve num of blocks backwards starting from id from the given peer: the function
-    /// returns a future that is either fulfilled with BlockRetrievalResponse, or with a
-    /// BlockRetrievalFailure.
+    /// returns a future that is fulfilled with BlockRetrievalResponse.
     pub async fn request_block<T: Payload>(
         &mut self,
-        block_id: HashValue,
-        num_blocks: u64,
+        retrieval_request: BlockRetrievalRequest,
         from: Author,
         timeout: Duration,
-    ) -> Result<BlockRetrievalResponse<T>, BlockRetrievalFailure> {
-        if from == self.author {
-            return Err(BlockRetrievalFailure::SelfRetrieval);
-        }
-        let mut req_msg = RequestBlock::new();
-        req_msg.set_block_id(block_id.into());
-        req_msg.set_num_blocks(num_blocks);
-        counters::BLOCK_RETRIEVAL_COUNT.inc_by(num_blocks as i64);
+    ) -> failure::Result<BlockRetrievalResponse<T>> {
+        ensure!(from != self.author, "Retrieve block from self");
+        counters::BLOCK_RETRIEVAL_COUNT.inc_by(retrieval_request.num_blocks() as i64);
         let pre_retrieval_instant = Instant::now();
-
-        let mut res_block = self
+        let req_msg = RequestBlock::try_from(retrieval_request.clone())?;
+        let response_msg = self
             .network_sender
             .request_block(from, req_msg, timeout)
             .await?;
-        let mut blocks = vec![];
-        for block in res_block.take_blocks().into_iter() {
-            if let Ok(block) = Block::from_proto(block) {
-                if block.verify(self.validator.as_ref()).is_err() {
-                    return Err(BlockRetrievalFailure::InvalidSignature);
-                }
-                blocks.push(block);
-            } else {
-                return Err(BlockRetrievalFailure::InvalidResponse);
-            }
-        }
-        counters::BLOCK_RETRIEVAL_DURATION_MS
-            .observe(pre_retrieval_instant.elapsed().as_millis() as f64);
-        let response = BlockRetrievalResponse {
-            status: res_block.get_status(),
-            blocks,
-        };
-        if response.verify(block_id, num_blocks).is_err() {
-            return Err(BlockRetrievalFailure::InvalidResponse);
-        }
+        counters::BLOCK_RETRIEVAL_DURATION_S.observe_duration(pre_retrieval_instant.elapsed());
+        let response = BlockRetrievalResponse::<T>::try_from(response_msg)?;
+        response.verify(
+            retrieval_request.block_id(),
+            retrieval_request.num_blocks(),
+            self.validators.as_ref(),
+        )?;
         Ok(response)
     }
 
@@ -248,30 +124,41 @@ impl ConsensusNetworkImpl {
     /// internal(to provide back pressure), it does not indicate the message is delivered or sent
     /// out. It does not give indication about when the message is delivered to the recipients,
     /// as well as there is no indication about the network failures.
-    pub async fn broadcast_proposal<T: Payload, P: ProposerInfo>(
-        &mut self,
-        proposal: ProposalInfo<T, P>,
-    ) {
-        let mut msg = ConsensusMsg::new();
-        msg.set_proposal(proposal.into_proto());
+    pub async fn broadcast_proposal<T: Payload>(&mut self, proposal: ProposalMsg<T>) {
+        let proposal = match proposal.try_into() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Fail to serialize VoteMsg: {:?}", e);
+                return;
+            }
+        };
+        let msg = ConsensusMsg {
+            message: Some(ConsensusMsg_oneof::Proposal(proposal)),
+        };
         self.broadcast(msg).await
     }
 
     async fn broadcast(&mut self, msg: ConsensusMsg) {
-        for peer in self.peers.iter() {
-            if self.author == *peer {
-                let self_msg = Event::Message((self.author, msg.clone()));
-                if let Err(err) = self.self_sender.send(Ok(self_msg)).await {
-                    error!("Error delivering a self proposal: {:?}", err);
-                }
-                continue;
-            }
-            if let Err(err) = self.network_sender.send_to(*peer, msg.clone()).await {
-                error!(
-                    "Error broadcasting proposal to peer: {:?}, error: {:?}, msg: {:?}",
-                    peer, err, msg
-                );
-            }
+        // Directly send the message to ourself without going through network.
+        let self_msg = Event::Message((self.author, msg.clone()));
+        if let Err(err) = self.self_sender.send(Ok(self_msg)).await {
+            error!("Error broadcasting to self: {:?}", err);
+        }
+
+        // Get the list of validators excluding our own account address.
+        let self_author = self.author;
+        let other_validators = self
+            .validators
+            .get_account_addresses_iter()
+            .filter(|author| author != &self_author);
+
+        // Broadcast message over direct-send to all other validators.
+        if let Err(err) = self
+            .network_sender
+            .send_to_many(other_validators, msg)
+            .await
+        {
+            error!("Error broadcasting message: {:?}", err);
         }
     }
 
@@ -286,8 +173,16 @@ impl ConsensusNetworkImpl {
     pub async fn send_vote(&self, vote_msg: VoteMsg, recipients: Vec<Author>) {
         let mut network_sender = self.network_sender.clone();
         let mut self_sender = self.self_sender.clone();
-        let mut msg = ConsensusMsg::new();
-        msg.set_vote(vote_msg.into_proto());
+        let vote_msg = match vote_msg.try_into() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Fail to serialize VoteMsg: {:?}", e);
+                return;
+            }
+        };
+        let msg = ConsensusMsg {
+            message: Some(ConsensusMsg_oneof::VoteMsg(vote_msg)),
+        };
         for peer in recipients {
             if self.author == peer {
                 let self_msg = Event::Message((self.author, msg.clone()));
@@ -302,59 +197,184 @@ impl ConsensusNetworkImpl {
         }
     }
 
-    /// Broadcasts new round (including timeout) messages to all validators
-    pub async fn broadcast_new_round(&mut self, new_round_msg: NewRoundMsg) {
-        let mut msg = ConsensusMsg::new();
-        msg.set_new_round(new_round_msg.into_proto());
+    /// Broadcasts vote message to all validators
+    pub async fn broadcast_vote(&mut self, vote_msg: VoteMsg) {
+        let vote_msg = match vote_msg.try_into() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Fail to serialize VoteMsg: {:?}", e);
+                return;
+            }
+        };
+        let msg = ConsensusMsg {
+            message: Some(ConsensusMsg_oneof::VoteMsg(vote_msg)),
+        };
         self.broadcast(msg).await
+    }
+
+    /// Sends the given sync info to the given author.
+    /// The future is fulfilled as soon as the message is added to the internal network channel
+    /// (does not indicate whether the message is delivered or sent out).
+    pub async fn send_sync_info(&self, sync_info: SyncInfo, recipient: Author) {
+        if recipient == self.author {
+            error!("An attempt to deliver sync info msg to itself: ignore.");
+            return;
+        }
+        let sync_info = match sync_info.try_into() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("Fail to serialize SyncInfo: {:?}", e);
+                return;
+            }
+        };
+        let msg = ConsensusMsg {
+            message: Some(ConsensusMsg_oneof::SyncInfo(sync_info)),
+        };
+        let mut network_sender = self.network_sender.clone();
+        if let Err(e) = network_sender.send_to(recipient, msg).await {
+            warn!(
+                "Failed to send a sync info msg to peer {:?}: {:?}",
+                recipient, e
+            );
+        }
+    }
+
+    /// Broadcast about epoch changes with proof to the current validator set (including self)
+    /// when we commit the reconfiguration block
+    pub async fn broadcast_epoch_change(&mut self, proof: ValidatorChangeEventWithProof) {
+        let msg = ConsensusMsg {
+            message: Some(ConsensusMsg_oneof::EpochChange(proof.into())),
+        };
+        self.broadcast(msg).await
+    }
+
+    pub async fn notify_epoch_change(&mut self, proof: ValidatorChangeEventWithProof) {
+        let msg = ConsensusMsg {
+            message: Some(ConsensusMsg_oneof::EpochChange(proof.into())),
+        };
+        let self_msg = Event::Message((self.author, msg.clone()));
+        if let Err(e) = self.self_sender.send(Ok(self_msg)).await {
+            warn!("Failed to notify to self an epoch change {:?}", e);
+        }
     }
 }
 
-struct NetworkTask<T, P, S> {
-    proposal_tx: channel::Sender<ProposalInfo<T, P>>,
-    vote_tx: channel::Sender<VoteMsg>,
-    block_request_tx: channel::Sender<BlockRetrievalRequest<T>>,
-    chunk_request_tx: channel::Sender<ChunkRetrievalRequest>,
-    new_round_tx: channel::Sender<NewRoundMsg>,
-    all_events: S,
-    validator: Arc<ValidatorVerifier>,
+pub struct NetworkTask<T> {
+    epoch: u64,
+    proposal_tx: libra_channel::Sender<AccountAddress, ProposalMsg<T>>,
+    vote_tx: libra_channel::Sender<AccountAddress, VoteMsg>,
+    block_request_tx: libra_channel::Sender<AccountAddress, IncomingBlockRetrievalRequest>,
+    sync_info_tx: libra_channel::Sender<AccountAddress, (SyncInfo, AccountAddress)>,
+    epoch_change_tx: libra_channel::Sender<AccountAddress, LedgerInfoWithSignatures>,
+    different_epoch_tx: libra_channel::Sender<AccountAddress, (u64, AccountAddress)>,
+    epoch_retrieval_tx: libra_channel::Sender<AccountAddress, (u64, AccountAddress)>,
+    all_events: Box<dyn Stream<Item = failure::Result<Event<ConsensusMsg>>> + Send + Unpin>,
+    validators: Arc<ValidatorVerifier>,
 }
 
-impl<T, P, S> NetworkTask<T, P, S>
-where
-    S: Stream<Item = Result<Event<ConsensusMsg>, failure::Error>> + Unpin,
-    T: Payload,
-    P: ProposerInfo,
-{
-    pub async fn run(mut self) {
+impl<T: Payload> NetworkTask<T> {
+    /// Establishes the initial connections with the peers and returns the receivers.
+    pub fn new(
+        epoch: u64,
+        network_events: ConsensusNetworkEvents,
+        self_receiver: channel::Receiver<failure::Result<Event<ConsensusMsg>>>,
+        validators: Arc<ValidatorVerifier>,
+    ) -> (NetworkTask<T>, NetworkReceivers<T>) {
+        let (proposal_tx, proposal_rx) =
+            libra_channel::new(QueueStyle::LIFO, 1, Some(&counters::PROPOSAL_CHANNEL_MSGS));
+        let (vote_tx, vote_rx) =
+            libra_channel::new(QueueStyle::LIFO, 1, Some(&counters::VOTES_CHANNEL_MSGS));
+        let (block_request_tx, block_request_rx) = libra_channel::new(
+            QueueStyle::LIFO,
+            1,
+            Some(&counters::BLOCK_RETRIEVAL_CHANNEL_MSGS),
+        );
+        let (sync_info_tx, sync_info_rx) =
+            libra_channel::new(QueueStyle::LIFO, 1, Some(&counters::SYNC_INFO_CHANNEL_MSGS));
+        let (epoch_change_tx, epoch_change_rx) = libra_channel::new(
+            QueueStyle::LIFO,
+            1,
+            Some(&counters::EPOCH_CHANGE_CHANNEL_MSGS),
+        );
+        let (different_epoch_tx, different_epoch_rx) =
+            libra_channel::new(QueueStyle::LIFO, 1, None);
+        let (epoch_retrieval_tx, epoch_retrieval_rx) =
+            libra_channel::new(QueueStyle::LIFO, 1, None);
+        let network_events = network_events.map_err(Into::<failure::Error>::into);
+        let all_events = Box::new(select(network_events, self_receiver));
+        (
+            NetworkTask {
+                epoch,
+                proposal_tx,
+                vote_tx,
+                block_request_tx,
+                sync_info_tx,
+                epoch_change_tx,
+                different_epoch_tx,
+                epoch_retrieval_tx,
+                all_events,
+                validators,
+            },
+            NetworkReceivers {
+                proposals: proposal_rx,
+                votes: vote_rx,
+                block_retrieval: block_request_rx,
+                sync_info_msgs: sync_info_rx,
+                epoch_change: epoch_change_rx,
+                different_epoch: different_epoch_rx,
+                epoch_retrieval: epoch_retrieval_rx,
+            },
+        )
+    }
+
+    pub async fn start(mut self) {
+        use ConsensusMsg_oneof::*;
         while let Some(Ok(message)) = self.all_events.next().await {
             match message {
-                Event::Message((peer_id, mut msg)) => {
-                    let r = if msg.has_proposal() {
-                        self.process_proposal(&mut msg).await
-                    } else if msg.has_vote() {
-                        self.process_vote(&mut msg).await
-                    } else if msg.has_new_round() {
-                        self.process_new_round(&mut msg).await
-                    } else {
-                        warn!("Unexpected msg from {}: {:?}", peer_id, msg);
-                        continue;
+                Event::Message((peer_id, msg)) => {
+                    let msg = match msg.message {
+                        Some(msg) => msg,
+                        None => {
+                            warn!("Unexpected msg from {}: {:?}", peer_id, msg);
+                            continue;
+                        }
+                    };
+
+                    let r = match msg.clone() {
+                        Proposal(proposal) => {
+                            self.process_proposal(peer_id, proposal).await.map_err(|e| {
+                                security_log(SecurityEvent::InvalidConsensusProposal)
+                                    .error(&e)
+                                    .data(&msg)
+                                    .log();
+                                e
+                            })
+                        }
+                        VoteMsg(vote_msg) => self.process_vote(peer_id, vote_msg).await,
+                        SyncInfo(sync_info) => self.process_sync_info(sync_info, peer_id).await,
+                        EpochChange(proof) => self.process_epoch_change(peer_id, proof).await,
+                        RequestEpoch(request) => self.process_epoch_request(peer_id, request).await,
+                        _ => {
+                            warn!("Unexpected msg from {}: {:?}", peer_id, msg);
+                            continue;
+                        }
                     };
                     if let Err(e) = r {
-                        warn!("Failed to process msg {:?}: {:?}", msg, e)
+                        warn!("Failed to process msg {}", e)
                     }
                 }
-                Event::RpcRequest((peer_id, mut msg, callback)) => {
-                    let r = if msg.has_request_block() {
-                        self.process_request_block(&mut msg, callback).await
-                    } else if msg.has_request_chunk() {
-                        self.process_request_chunk(&mut msg, callback).await
-                    } else {
-                        warn!("Unexpected RPC from {}: {:?}", peer_id, msg);
-                        continue;
+                Event::RpcRequest((peer_id, msg, callback)) => {
+                    let r = match msg.message {
+                        Some(RequestBlock(request)) => {
+                            self.process_request_block(peer_id, request, callback).await
+                        }
+                        _ => {
+                            warn!("Unexpected RPC from {}: {:?}", peer_id, msg);
+                            continue;
+                        }
                     };
                     if let Err(e) = r {
-                        warn!("Failed to process RPC {:?}: {:?}", msg, e)
+                        warn!("Failed to process RPC {:?}", e)
                     }
                 }
                 Event::NewPeer(peer_id) => {
@@ -367,119 +387,128 @@ where
         }
     }
 
-    async fn process_proposal<'a>(&'a mut self, msg: &'a mut ConsensusMsg) -> failure::Result<()> {
-        let proposal = ProposalInfo::<T, P>::from_proto(msg.take_proposal())?;
-        proposal.verify(self.validator.as_ref()).map_err(|e| {
-            security_log(SecurityEvent::InvalidConsensusProposal)
-                .error(&e)
-                .data(&proposal)
-                .log();
-            e
-        })?;
+    async fn process_proposal(
+        &mut self,
+        peer_id: AccountAddress,
+        proposal: Proposal,
+    ) -> failure::Result<()> {
+        let proposal = ProposalUncheckedSignatures::<T>::try_from(proposal)?;
+        if proposal.epoch() != self.epoch {
+            return self
+                .different_epoch_tx
+                .push(peer_id, (proposal.epoch(), peer_id));
+        }
+
+        let proposal = proposal
+            .validate_signatures(self.validators.as_ref())?
+            .verify_well_formed()?;
+        ensure!(
+            proposal.proposal().author() == Some(peer_id),
+            "proposal received must be from the sending peer"
+        );
         debug!("Received proposal {}", proposal);
-        self.proposal_tx.send(proposal).await?;
-        Ok(())
+        self.proposal_tx.push(peer_id, proposal)
     }
 
-    async fn process_vote<'a>(&'a mut self, msg: &'a mut ConsensusMsg) -> failure::Result<()> {
-        let vote = VoteMsg::from_proto(msg.take_vote())?;
-        debug!("Received {}", vote);
-        vote.verify(self.validator.as_ref()).map_err(|e| {
+    async fn process_vote(
+        &mut self,
+        peer_id: AccountAddress,
+        vote_msg: VoteMsgProto,
+    ) -> failure::Result<()> {
+        let vote_msg = VoteMsg::try_from(vote_msg)?;
+
+        ensure!(
+            vote_msg.vote().author() == peer_id,
+            "vote received must be from the sending peer"
+        );
+
+        if vote_msg.epoch() != self.epoch {
+            return self
+                .different_epoch_tx
+                .push(peer_id, (vote_msg.epoch(), peer_id));
+        }
+
+        debug!("Received {}", vote_msg);
+        vote_msg.verify(self.validators.as_ref()).map_err(|e| {
             security_log(SecurityEvent::InvalidConsensusVote)
                 .error(&e)
-                .data(&vote)
+                .data(&vote_msg)
                 .log();
             e
         })?;
-        self.vote_tx.send(vote).await?;
-        Ok(())
+        self.vote_tx.push(peer_id, vote_msg)
     }
 
-    async fn process_new_round<'a>(&'a mut self, msg: &'a mut ConsensusMsg) -> failure::Result<()> {
-        let new_round = NewRoundMsg::from_proto(msg.take_new_round())?;
-        new_round.verify(self.validator.as_ref()).map_err(|e| {
-            security_log(SecurityEvent::InvalidConsensusRound)
-                .error(&e)
-                .data(&new_round)
-                .log();
-            e
-        })?;
-        self.new_round_tx.send(new_round).await?;
-        Ok(())
+    async fn process_sync_info(
+        &mut self,
+        sync_info: SyncInfoProto,
+        peer_id: AccountAddress,
+    ) -> failure::Result<()> {
+        let sync_info = SyncInfo::try_from(sync_info)?;
+        match sync_info.epoch().cmp(&self.epoch) {
+            Ordering::Equal => {
+                // SyncInfo verification is postponed to the moment it's actually used.
+                self.sync_info_tx.push(peer_id, (sync_info, peer_id))
+            }
+            Ordering::Less | Ordering::Greater => self
+                .different_epoch_tx
+                .push(peer_id, (sync_info.epoch(), peer_id)),
+        }
     }
 
-    async fn process_request_chunk<'a>(
-        &'a mut self,
-        msg: &'a mut ConsensusMsg,
+    async fn process_request_block(
+        &mut self,
+        peer_id: AccountAddress,
+        request_msg: RequestBlock,
         callback: oneshot::Sender<Result<Bytes, RpcError>>,
     ) -> failure::Result<()> {
-        let mut req = msg.take_request_chunk();
-        debug!(
-            "Received request_chunk RPC for start version: {} target: {:?} batch_size: {}",
-            req.start_version,
-            req.get_target(),
-            req.batch_size
-        );
-        let (tx, rx) = oneshot::channel();
-        let target = QuorumCert::from_proto(req.take_target())?;
-        target.verify(self.validator.as_ref())?;
-        let request = ChunkRetrievalRequest {
-            start_version: req.start_version,
-            target,
-            batch_size: req.batch_size,
-            response_sender: tx,
+        let req = BlockRetrievalRequest::try_from(request_msg)?;
+        debug!("Received block retrieval request {}", req);
+        let req_with_callback = IncomingBlockRetrievalRequest {
+            req,
+            response_sender: callback,
         };
-        self.chunk_request_tx.send(request).await?;
-        callback
-            .send(match rx.await? {
-                Ok(txn_list_with_proof) => {
-                    let mut response_msg = ConsensusMsg::new();
-                    let mut response = RespondChunk::new();
-                    response.set_txn_list_with_proof(txn_list_with_proof.into_proto());
-                    response_msg.set_respond_chunk(response);
-                    let response_data = Bytes::from(
-                        response_msg
-                            .write_to_bytes()
-                            .expect("fail to serialize proto"),
-                    );
-                    Ok(response_data)
-                }
-                Err(err) => Err(RpcError::ApplicationError(err)),
-            })
-            .map_err(|_| format_err!("handling inbound rpc call timed out"))
+        self.block_request_tx.push(peer_id, req_with_callback)
     }
 
-    async fn process_request_block<'a>(
-        &'a mut self,
-        msg: &'a mut ConsensusMsg,
-        callback: oneshot::Sender<Result<Bytes, RpcError>>,
+    async fn process_epoch_change(
+        &mut self,
+        peer_id: AccountAddress,
+        proof: ValidatorChangeEventWithProofProto,
     ) -> failure::Result<()> {
-        let block_id = HashValue::from_slice(msg.get_request_block().get_block_id())?;
-        let num_blocks = msg.get_request_block().get_num_blocks();
-        debug!(
-            "Received request_block RPC for {} blocks from {:?}",
-            num_blocks, block_id
-        );
-        let (tx, rx) = oneshot::channel();
-        let request = BlockRetrievalRequest {
-            block_id,
-            num_blocks,
-            response_sender: tx,
-        };
-        self.block_request_tx.send(request).await?;
-        let BlockRetrievalResponse { status, blocks } = rx.await?;
-        let mut response_msg = ConsensusMsg::new();
-        let mut response = RespondBlock::new();
-        response.set_status(status);
-        response.set_blocks(blocks.into_iter().map(IntoProto::into_proto).collect());
-        response_msg.set_respond_block(response);
-        let response_data = Bytes::from(
-            response_msg
-                .write_to_bytes()
-                .expect("fail to serialize proto"),
-        );
-        callback
-            .send(Ok(response_data))
-            .map_err(|_| format_err!("handling inbound rpc call timed out"))
+        let proof = ValidatorChangeEventWithProof::try_from(proof)?;
+        let msg_epoch = proof.epoch()?;
+        match msg_epoch.cmp(&self.epoch) {
+            Ordering::Equal => {
+                let target_ledger_info = proof.verify(self.epoch, &self.validators)?;
+                let validators = match target_ledger_info.ledger_info().next_validator_set() {
+                    Some(v) => v.into(),
+                    None => bail!("Epoch change doesn't carry next validator set"),
+                };
+                self.epoch = target_ledger_info.ledger_info().epoch() + 1;
+                self.validators = Arc::new(validators);
+                self.epoch_change_tx.push(peer_id, target_ledger_info)
+            }
+            Ordering::Less | Ordering::Greater => {
+                self.different_epoch_tx.push(peer_id, (msg_epoch, peer_id))
+            }
+        }
+    }
+
+    async fn process_epoch_request(
+        &mut self,
+        peer_id: AccountAddress,
+        request: RequestEpoch,
+    ) -> failure::Result<()> {
+        let request = EpochRetrievalRequest::try_from(request)?;
+        match request.target_epoch.cmp(&self.epoch) {
+            Ordering::Less | Ordering::Equal => self
+                .epoch_retrieval_tx
+                .push(peer_id, (request.start_epoch, peer_id)),
+            Ordering::Greater => {
+                warn!("Received EpochRetrievalRequest beyond what we have locally");
+                Ok(())
+            }
+        }
     }
 }

@@ -5,26 +5,16 @@
 
 use crate::{
     error::NetworkError,
-    interface::{NetworkNotification, NetworkRequest},
+    interface::NetworkRequest,
     proto::MempoolSyncMsg,
-    protocols::direct_send::Message,
-    validator_network::Event,
+    validator_network::{NetworkEvents, NetworkSender},
     ProtocolId,
 };
-use bytes::Bytes;
 use channel;
-use futures::{
-    stream::Map,
-    task::{Context, Poll},
-    SinkExt, Stream, StreamExt,
-};
-use pin_utils::unsafe_pinned;
-use protobuf::Message as proto_msg;
-use std::pin::Pin;
-use types::PeerId;
+use libra_types::PeerId;
 
 /// Protocol id for mempool direct-send calls
-pub const MEMPOOL_DIRECT_SEND_PROTOCOL: &[u8] = b"/libra/mempool/direct-send/0.1.0";
+pub const MEMPOOL_DIRECT_SEND_PROTOCOL: &[u8] = b"/libra/direct-send/0.1.0/mempool/0.1.0";
 
 /// The interface from Network to Mempool layer.
 ///
@@ -32,58 +22,12 @@ pub const MEMPOOL_DIRECT_SEND_PROTOCOL: &[u8] = b"/libra/mempool/direct-send/0.1
 /// raw `Bytes` direct-send and rpc messages are deserialized into
 /// `MempoolMessage` types. `MempoolNetworkEvents` is a thin wrapper around an
 /// `channel::Receiver<NetworkNotification>`.
-pub struct MempoolNetworkEvents {
-    // TODO(philiphayes): remove pub
-    pub inner: Map<
-        channel::Receiver<NetworkNotification>,
-        fn(NetworkNotification) -> Result<Event<MempoolSyncMsg>, NetworkError>,
-    >,
-}
-
-impl MempoolNetworkEvents {
-    // This use of `unsafe_pinned` is safe because:
-    //   1. This struct does not implement [`Drop`]
-    //   2. This struct does not implement [`Unpin`]
-    //   3. This struct is not `#[repr(packed)]`
-    unsafe_pinned!(
-        inner:
-            Map<
-                channel::Receiver<NetworkNotification>,
-                fn(NetworkNotification) -> Result<Event<MempoolSyncMsg>, NetworkError>,
-            >
-    );
-
-    pub fn new(receiver: channel::Receiver<NetworkNotification>) -> Self {
-        let inner = receiver
-            // TODO(philiphayes): filter_map might be better, so we can drop
-            // messages that don't deserialize.
-            .map::<_, fn(_) -> _>(|notification| match notification {
-                NetworkNotification::NewPeer(peer_id) => Ok(Event::NewPeer(peer_id)),
-                NetworkNotification::LostPeer(peer_id) => Ok(Event::LostPeer(peer_id)),
-                NetworkNotification::RecvRpc(_, _) => {
-                    unimplemented!("Mempool does not currently use RPC");
-                }
-                NetworkNotification::RecvMessage(peer_id, msg) => {
-                    let msg = ::protobuf::parse_from_bytes(msg.mdata.as_ref())?;
-                    Ok(Event::Message((peer_id, msg)))
-                }
-            });
-
-        Self { inner }
-    }
-}
-
-impl Stream for MempoolNetworkEvents {
-    type Item = Result<Event<MempoolSyncMsg>, NetworkError>;
-
-    fn poll_next(self: Pin<&mut Self>, context: &mut Context) -> Poll<Option<Self::Item>> {
-        self.inner().poll_next(context)
-    }
-}
+pub type MempoolNetworkEvents = NetworkEvents<MempoolSyncMsg>;
 
 /// The interface from Mempool to Networking layer.
 ///
-/// This is a thin wrapper around an `channel::Sender<NetworkRequest>`, so it is
+/// This is a thin wrapper around a `NetworkSender<MempoolSyncMsg>`, which is in
+/// turn a thin wrapper around a `channel::Sender<NetworkRequest>`, so it is
 /// easy to clone and send off to a separate task. For example, the rpc requests
 /// return Futures that encapsulate the whole flow, from sending the request to
 /// remote, to finally receiving the response and deserializing. It therefore
@@ -91,47 +35,38 @@ impl Stream for MempoolNetworkEvents {
 /// requires the `MempoolNetworkSender` to be `Clone` and `Send`.
 #[derive(Clone)]
 pub struct MempoolNetworkSender {
-    // TODO(philiphayes): remove pub
-    pub inner: channel::Sender<NetworkRequest>,
+    inner: NetworkSender<MempoolSyncMsg>,
 }
 
 impl MempoolNetworkSender {
     pub fn new(inner: channel::Sender<NetworkRequest>) -> Self {
-        Self { inner }
+        Self {
+            inner: NetworkSender::new(inner),
+        }
     }
 
-    /// Send a fire-and-forget "direct-send" message to remote peer `recipient`.
-    ///
-    /// Currently, the returned Future simply resolves when the message has been
-    /// enqueued on the network actor's event queue. It therefore makes no
-    /// reliable delivery guarantees.
     pub async fn send_to(
         &mut self,
         recipient: PeerId,
         message: MempoolSyncMsg,
     ) -> Result<(), NetworkError> {
-        self.inner
-            .send(NetworkRequest::SendMessage(
-                recipient,
-                Message {
-                    protocol: ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL),
-                    mdata: Bytes::from(message.write_to_bytes().unwrap()),
-                },
-            ))
-            .await?;
-        Ok(())
+        let protocol = ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL);
+        self.inner.send_to(recipient, protocol, message).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::executor::block_on;
+    use crate::{
+        interface::NetworkNotification, protocols::direct_send::Message, utils::MessageExt,
+        validator_network::Event,
+    };
+    use futures::{executor::block_on, sink::SinkExt, stream::StreamExt};
 
     fn new_test_sync_msg(peer_id: PeerId) -> MempoolSyncMsg {
-        let mut mempool_msg = MempoolSyncMsg::new();
-        mempool_msg.set_peer_id(peer_id.into());
-        mempool_msg.set_transactions(::protobuf::RepeatedField::from_vec(vec![]));
+        let mut mempool_msg = MempoolSyncMsg::default();
+        mempool_msg.peer_id = peer_id.into();
         mempool_msg
     }
 
@@ -146,20 +81,16 @@ mod tests {
         let mempool_msg = new_test_sync_msg(peer_id);
         let network_msg = Message {
             protocol: ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL),
-            mdata: mempool_msg.write_to_bytes().unwrap().into(),
+            mdata: mempool_msg.clone().to_bytes().unwrap(),
         };
 
-        block_on(mempool_tx.send(NetworkNotification::RecvMessage(
-            PeerId::from(peer_id),
-            network_msg,
-        )))
-        .unwrap();
+        block_on(mempool_tx.send(NetworkNotification::RecvMessage(peer_id, network_msg))).unwrap();
         let event = block_on(stream.next()).unwrap().unwrap();
-        assert_eq!(event, Event::Message((peer_id.into(), mempool_msg)));
+        assert_eq!(event, Event::Message((peer_id, mempool_msg)));
 
-        block_on(mempool_tx.send(NetworkNotification::NewPeer(PeerId::from(peer_id)))).unwrap();
+        block_on(mempool_tx.send(NetworkNotification::NewPeer(peer_id))).unwrap();
         let event = block_on(stream.next()).unwrap().unwrap();
-        assert_eq!(event, Event::NewPeer(peer_id.into()));
+        assert_eq!(event, Event::NewPeer(peer_id));
     }
 
     // `MempoolNetworkSender` should serialize outbound messages
@@ -172,7 +103,7 @@ mod tests {
         let mempool_msg = new_test_sync_msg(peer_id);
         let expected_network_msg = Message {
             protocol: ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL),
-            mdata: mempool_msg.clone().write_to_bytes().unwrap().into(),
+            mdata: mempool_msg.clone().to_bytes().unwrap(),
         };
 
         // Send the message to network layer
@@ -182,7 +113,7 @@ mod tests {
         let event = block_on(network_reqs_rx.next()).unwrap();
         match event {
             NetworkRequest::SendMessage(recv_peer_id, network_msg) => {
-                assert_eq!(recv_peer_id, PeerId::from(peer_id));
+                assert_eq!(recv_peer_id, peer_id);
                 assert_eq!(network_msg, expected_network_msg);
             }
             event => panic!("Unexpected event: {:?}", event),

@@ -1,15 +1,14 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 use crate::account_address::{AccountAddress, ADDRESS_LENGTH};
 use bech32::Bech32;
-use crypto::{hash::CryptoHash, HashValue};
 use hex::FromHex;
+use libra_crypto::{hash::CryptoHash, HashValue};
 use proptest::prelude::*;
-use proto_conv::{FromProto, IntoProto};
-use rand::{thread_rng, Rng};
 use std::convert::{AsRef, TryFrom};
-use test::Bencher;
 
 #[test]
 fn test_address_bytes() {
@@ -56,7 +55,7 @@ fn test_address() {
     });
 
     let hash_vec =
-        &Vec::from_hex("2e10c936c9c69d9b4d99030e13b41c88bd09bb2b29bec7f48699f76eac383956")
+        &Vec::from_hex("84a1bb90a6130da458abde12cc8ea21f29c6e0bcda007491fff1852561b830a7")
             .expect("You must provide a valid Hex format");
 
     let mut hash = [0u8; 32];
@@ -94,26 +93,10 @@ fn test_bech32() {
     );
 }
 
-#[bench]
-fn test_n_bech32(bh: &mut Bencher) {
-    bh.iter(|| {
-        let mut rng = thread_rng();
-        let random_bytes: [u8; ADDRESS_LENGTH] = rng.gen();
-        let address = AccountAddress::new(random_bytes);
-        let bech32 = Bech32::try_from(address).unwrap();
-        let address_from_bech32 = AccountAddress::try_from(bech32)
-            .expect("The provided input string is not valid bech32 format");
-        assert_eq!(
-            address.as_ref().to_vec(),
-            address_from_bech32.as_ref().to_vec()
-        );
-    });
-}
-
 #[test]
 fn test_address_from_proto_invalid_length() {
     let bytes = vec![1; 123];
-    assert!(AccountAddress::from_proto(bytes).is_err());
+    assert!(AccountAddress::try_from(&bytes[..]).is_err());
 }
 
 proptest! {
@@ -133,9 +116,9 @@ proptest! {
 
     #[test]
     fn test_address_protobuf_roundtrip(addr in any::<AccountAddress>()) {
-        let bytes = addr.into_proto();
+        let bytes = addr.to_vec();
         prop_assert_eq!(bytes.clone(), addr.as_ref());
-        let addr2 = AccountAddress::from_proto(bytes).unwrap();
+        let addr2 = AccountAddress::try_from(&bytes[..]).unwrap();
         prop_assert_eq!(addr, addr2);
     }
 }

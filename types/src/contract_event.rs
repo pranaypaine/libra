@@ -1,48 +1,53 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::unit_arg)]
+#![forbid(unsafe_code)]
+
 use crate::{
-    access_path::AccessPath,
-    account_config::AccountEvent,
-    ledger_info::LedgerInfo,
-    proof::{verify_event, EventProof},
-    transaction::Version,
-};
-use canonical_serialization::{
-    CanonicalSerialize, CanonicalSerializer, SimpleDeserializer, SimpleSerializer,
-};
-use crypto::{
-    hash::{ContractEventHasher, CryptoHash, CryptoHasher},
-    HashValue,
+    account_config::AccountEvent, event::EventKey, language_storage::TypeTag,
+    ledger_info::LedgerInfo, proof::EventProof, transaction::Version,
 };
 use failure::prelude::*;
+use libra_crypto::{
+    hash::{CryptoHash, CryptoHasher},
+    HashValue,
+};
+use libra_crypto_derive::CryptoHasher;
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto};
+use serde::{Deserialize, Serialize};
+use std::convert::{TryFrom, TryInto};
 
 /// Entry produced via a call to the `emit_event` builtin.
-#[derive(Clone, Default, Eq, PartialEq, FromProto, IntoProto)]
-#[ProtoType(crate::proto::events::Event)]
+#[derive(Hash, Clone, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
 pub struct ContractEvent {
-    /// The path that the event was emitted to
-    access_path: AccessPath,
+    /// The unique key that the event was emitted to
+    key: EventKey,
     /// The number of messages that have been emitted to the path previously
     sequence_number: u64,
+    /// The type of the data
+    type_tag: TypeTag,
     /// The data payload of the event
     event_data: Vec<u8>,
 }
 
 impl ContractEvent {
-    pub fn new(access_path: AccessPath, sequence_number: u64, event_data: Vec<u8>) -> Self {
+    pub fn new(
+        key: EventKey,
+        sequence_number: u64,
+        type_tag: TypeTag,
+        event_data: Vec<u8>,
+    ) -> Self {
         ContractEvent {
-            access_path,
+            key,
             sequence_number,
+            type_tag,
             event_data,
         }
     }
 
-    pub fn access_path(&self) -> &AccessPath {
-        &self.access_path
+    pub fn key(&self) -> &EventKey {
+        &self.key
     }
 
     pub fn sequence_number(&self) -> u64 {
@@ -52,15 +57,20 @@ impl ContractEvent {
     pub fn event_data(&self) -> &[u8] {
         &self.event_data
     }
+
+    pub fn type_tag(&self) -> &TypeTag {
+        &self.type_tag
+    }
 }
 
 impl std::fmt::Debug for ContractEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ContractEvent {{ access_path: {:?}, index: {:?}, event_data: {:?} }}",
-            self.access_path,
+            "ContractEvent {{ key: {:?}, index: {:?}, type: {:?}, event_data: {:?} }}",
+            self.key,
             self.sequence_number,
+            self.type_tag,
             hex::encode(&self.event_data)
         )
     }
@@ -68,25 +78,15 @@ impl std::fmt::Debug for ContractEvent {
 
 impl std::fmt::Display for ContractEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Ok(payload) = SimpleDeserializer::deserialize::<AccountEvent>(&self.event_data) {
+        if let Ok(payload) = AccountEvent::try_from(&self.event_data) {
             write!(
                 f,
-                "ContractEvent {{ access_path: {}, index: {:?}, event_data: {:?} }}",
-                self.access_path, self.sequence_number, payload,
+                "ContractEvent {{ key: {}, index: {:?}, type: {:?}, event_data: {:?} }}",
+                self.key, self.sequence_number, self.type_tag, payload,
             )
         } else {
             write!(f, "{:?}", self)
         }
-    }
-}
-
-impl CanonicalSerialize for ContractEvent {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer
-            .encode_struct(&self.access_path)?
-            .encode_u64(self.sequence_number)?
-            .encode_variable_length_bytes(&self.event_data)?;
-        Ok(())
     }
 }
 
@@ -95,15 +95,38 @@ impl CryptoHash for ContractEvent {
 
     fn hash(&self) -> HashValue {
         let mut state = Self::Hasher::default();
-        state.write(&SimpleSerializer::<Vec<u8>>::serialize(self).expect("Failed to serialize."));
+        state.write(&lcs::to_bytes(self).expect("Failed to serialize."));
         state.finish()
     }
 }
 
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, FromProto, IntoProto)]
-#[ProtoType(crate::proto::events::EventWithProof)]
+impl TryFrom<crate::proto::types::Event> for ContractEvent {
+    type Error = Error;
+
+    fn try_from(event: crate::proto::types::Event) -> Result<Self> {
+        let key = EventKey::try_from(event.key.as_ref())?;
+        let sequence_number = event.sequence_number;
+        let type_tag = lcs::from_bytes(&event.type_tag)?;
+        let event_data = event.event_data;
+        Ok(Self::new(key, sequence_number, type_tag, event_data))
+    }
+}
+
+impl From<ContractEvent> for crate::proto::types::Event {
+    fn from(event: ContractEvent) -> Self {
+        Self {
+            key: event.key.to_vec(),
+            sequence_number: event.sequence_number,
+            type_tag: lcs::to_bytes(&event.type_tag).expect("Failed to serialize."),
+            event_data: event.event_data,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct EventWithProof {
-    pub transaction_version: u64, // Should be `Version`, but FromProto derive won't work that way.
+    pub transaction_version: u64, // Should be `Version`
     pub event_index: u64,
     pub event: ContractEvent,
     pub proof: EventProof,
@@ -140,7 +163,7 @@ impl EventWithProof {
     ///
     /// Two things are ensured if no error is raised:
     ///   1. This event exists in the ledger represented by `ledger_info`.
-    ///   2. And this event has the same `access_path`, `sequence_number`, `transaction_version`,
+    ///   2. And this event has the same `event_key`, `sequence_number`, `transaction_version`,
     /// and `event_index` as indicated in the parameter list. If any of these parameter is unknown
     /// to the call site and is supposed to be informed by this struct, get it from the struct
     /// itself, such as: `event_with_proof.event.access_path()`, `event_with_proof.event_index()`,
@@ -148,16 +171,16 @@ impl EventWithProof {
     pub fn verify(
         &self,
         ledger_info: &LedgerInfo,
-        access_path: &AccessPath,
+        event_key: &EventKey,
         sequence_number: u64,
         transaction_version: Version,
         event_index: u64,
     ) -> Result<()> {
         ensure!(
-            self.event.access_path() == access_path,
-            "Access path ({}) not expected ({}).",
-            self.event.access_path(),
-            *access_path,
+            self.event.key() == event_key,
+            "Event key ({}) not expected ({}).",
+            self.event.key(),
+            *event_key,
         );
         ensure!(
             self.event.sequence_number == sequence_number,
@@ -178,14 +201,43 @@ impl EventWithProof {
             event_index,
         );
 
-        verify_event(
+        self.proof.verify(
             ledger_info,
             self.event.hash(),
             transaction_version,
             event_index,
-            &self.proof,
         )?;
 
         Ok(())
+    }
+}
+
+impl TryFrom<crate::proto::types::EventWithProof> for EventWithProof {
+    type Error = Error;
+
+    fn try_from(event: crate::proto::types::EventWithProof) -> Result<Self> {
+        Ok(Self::new(
+            event.transaction_version,
+            event.event_index,
+            event
+                .event
+                .ok_or_else(|| format_err!("Missing event"))?
+                .try_into()?,
+            event
+                .proof
+                .ok_or_else(|| format_err!("Missing proof"))?
+                .try_into()?,
+        ))
+    }
+}
+
+impl From<EventWithProof> for crate::proto::types::EventWithProof {
+    fn from(event: EventWithProof) -> Self {
+        Self {
+            transaction_version: event.transaction_version,
+            event_index: event.event_index,
+            event: Some(event.event.into()),
+            proof: Some(event.proof.into()),
+        }
     }
 }

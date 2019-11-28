@@ -1,10 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use canonical_serialization::{
-    CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-};
-use failure::Result;
+#![forbid(unsafe_code)]
+
 use hex;
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +26,10 @@ impl ByteArray {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
 }
 
 impl std::fmt::Debug for ByteArray {
@@ -48,20 +50,6 @@ impl std::ops::Index<usize> for ByteArray {
     #[inline]
     fn index(&self, index: usize) -> &Self::Output {
         std::ops::Index::index(&*self.0, index)
-    }
-}
-
-impl CanonicalSerialize for ByteArray {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer.encode_variable_length_bytes(&self.0)?;
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for ByteArray {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let bytes = deserializer.decode_variable_length_bytes()?;
-        Ok(ByteArray(bytes))
     }
 }
 

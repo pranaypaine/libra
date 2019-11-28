@@ -1,57 +1,23 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::vm_error::{
-    ArithmeticErrorType, BinaryError, DynamicReferenceErrorType, ExecutionStatus,
-    VMInvariantViolationError, VMStatus, VMValidationStatus, VMVerificationError,
-    VMVerificationStatus,
-};
-use proptest::prelude::*;
-use proto_conv::test_helper::assert_protobuf_encode_decode;
+#![forbid(unsafe_code)]
 
-proptest! {
-    #[test]
-    fn vm_validation_status_roundtrip(validation_status in any::<VMValidationStatus>()) {
-        assert_protobuf_encode_decode(&validation_status);
-    }
+use crate::vm_error::{StatusCode, VMStatus};
+use libra_prost_ext::test_helpers::assert_protobuf_encode_decode;
+use std::convert::TryFrom;
 
-    #[test]
-    fn vm_verification_error_roundtrip(verification_error in any::<VMVerificationError>()) {
-        assert_protobuf_encode_decode(&verification_error);
-    }
-
-    #[test]
-    fn vm_verification_status_roundtrip(verification_status in any::<VMVerificationStatus>()) {
-        assert_protobuf_encode_decode(&verification_status);
-    }
-
-    #[test]
-    fn vm_invariant_violation_roundtrip(invariant_violation in any::<VMInvariantViolationError>()) {
-        assert_protobuf_encode_decode(&invariant_violation);
-    }
-
-    #[test]
-    fn binary_error_roundtrip(binary_error in any::<BinaryError>()) {
-        assert_protobuf_encode_decode(&binary_error);
-    }
-
-    #[test]
-    fn dynamic_reference_error_roundtrip(dynamic_reference in any::<DynamicReferenceErrorType>()) {
-        assert_protobuf_encode_decode(&dynamic_reference);
-    }
-
-    #[test]
-    fn arithmetic_error_roundtrip(arithmetic_error in any::<ArithmeticErrorType>()) {
-        assert_protobuf_encode_decode(&arithmetic_error);
-    }
-
-    #[test]
-    fn execution_status_roundtrip(execution_status in any::<ExecutionStatus>()) {
-        assert_protobuf_encode_decode(&execution_status);
-    }
-
-    #[test]
-    fn test_vm_status(vm_status in any::<VMStatus>()) {
-        assert_protobuf_encode_decode(&vm_status);
+#[test]
+fn status_roundtrip() {
+    let max_error_number = 5000;
+    for status_number in 0..max_error_number {
+        let status =
+            StatusCode::try_from(status_number).unwrap_or_else(|_| StatusCode::UNKNOWN_STATUS);
+        if status != StatusCode::UNKNOWN_STATUS {
+            let stat_number: u64 = status.into();
+            assert!(stat_number == status_number);
+        }
+        let status = VMStatus::new(status);
+        assert_protobuf_encode_decode::<crate::proto::types::VmStatus, VMStatus>(&status);
     }
 }
