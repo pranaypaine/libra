@@ -16,6 +16,11 @@ use std::{
     task::{Context, Poll},
 };
 
+// Fuzzer for Noise
+#[cfg(any(feature = "fuzzing", test))]
+#[path = "noise_fuzzing.rs"]
+pub mod noise_fuzzing;
+
 const MAX_PAYLOAD_LENGTH: usize = u16::max_value() as usize; // 65535
 
 // The maximum number of bytes that we can buffer is 16 bytes less than u16::max_value() because
@@ -625,7 +630,7 @@ where
 mod test {
     use crate::{
         socket::{Handshake, NoiseSocket, MAX_PAYLOAD_LENGTH},
-        NOISE_IX_PARAMETER,
+        NOISE_PARAMETER,
     };
     use futures::{
         executor::block_on,
@@ -643,7 +648,7 @@ mod test {
         ),
         snow::error::Error,
     > {
-        let parameters: NoiseParams = NOISE_IX_PARAMETER.parse().expect("Invalid protocol name");
+        let parameters: NoiseParams = NOISE_PARAMETER.parse().expect("Invalid protocol name");
 
         let dialer_keypair = Builder::new(parameters.clone()).generate_keypair()?;
         let listener_keypair = Builder::new(parameters.clone()).generate_keypair()?;
@@ -651,7 +656,7 @@ mod test {
         let dialer_session = Builder::new(parameters.clone())
             .local_private_key(&dialer_keypair.private)
             .build_initiator()?;
-        let listener_session = Builder::new(parameters.clone())
+        let listener_session = Builder::new(parameters)
             .local_private_key(&listener_keypair.private)
             .build_responder()?;
 

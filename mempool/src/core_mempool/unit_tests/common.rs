@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::core_mempool::{CoreMempool, TimelineState, TxnPointer};
-use failure::prelude::*;
-use lazy_static::lazy_static;
+use anyhow::{format_err, Result};
 use libra_config::config::NodeConfig;
-use libra_crypto::ed25519::*;
-use libra_mempool_shared_proto::proto::mempool_status::MempoolAddTransactionStatusCode;
+use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
 use libra_types::{
     account_address::AccountAddress,
+    account_config::lbr_type_tag,
+    mempool_status::MempoolStatusCode,
     transaction::{RawTransaction, Script, SignedTransaction},
 };
+use once_cell::sync::Lazy;
 use rand::{rngs::StdRng, SeedableRng};
 use std::{collections::HashSet, iter::FromIterator};
 
@@ -21,10 +22,8 @@ pub(crate) fn setup_mempool() -> (CoreMempool, ConsensusMock) {
     )
 }
 
-lazy_static! {
-    static ref ACCOUNTS: Vec<AccountAddress> =
-        vec![AccountAddress::random(), AccountAddress::random()];
-}
+static ACCOUNTS: Lazy<Vec<AccountAddress>> =
+    Lazy::new(|| vec![AccountAddress::random(), AccountAddress::random()]);
 
 #[derive(Clone)]
 pub struct TestTransaction {
@@ -71,17 +70,18 @@ impl TestTransaction {
         let raw_txn = RawTransaction::new_script(
             TestTransaction::get_address(self.address),
             self.sequence_number,
-            Script::new(vec![], vec![]),
+            Script::new(vec![], vec![], vec![]),
             max_gas_amount,
             self.gas_price,
+            lbr_type_tag(),
             exp_time,
         );
         let mut seed: [u8; 32] = [0u8; 32];
         seed[..4].copy_from_slice(&[1, 2, 3, 4]);
         let mut rng: StdRng = StdRng::from_seed(seed);
-        let (privkey, pubkey) = compat::generate_keypair(&mut rng);
+        let privkey = Ed25519PrivateKey::generate(&mut rng);
         raw_txn
-            .sign(&privkey, pubkey)
+            .sign(&privkey, privkey.public_key())
             .expect("Failed to sign raw transaction.")
             .into_inner()
     }
@@ -99,7 +99,13 @@ pub(crate) fn add_txns_to_mempool(
     let mut transactions = vec![];
     for transaction in txns {
         let txn = transaction.make_signed_transaction();
-        pool.add_txn(txn.clone(), 0, 0, 1000, TimelineState::NotReady);
+        pool.add_txn(
+            txn.clone(),
+            0,
+            txn.gas_unit_price(),
+            0,
+            TimelineState::NotReady,
+        );
         transactions.push(txn);
     }
     transactions
@@ -111,12 +117,30 @@ pub(crate) fn add_txn(pool: &mut CoreMempool, transaction: TestTransaction) -> R
 
 pub(crate) fn add_signed_txn(pool: &mut CoreMempool, transaction: SignedTransaction) -> Result<()> {
     match pool
-        .add_txn(transaction, 0, 0, 1000, TimelineState::NotReady)
+        .add_txn(
+            transaction.clone(),
+            0,
+            transaction.gas_unit_price(),
+            0,
+            TimelineState::NotReady,
+        )
         .code
     {
-        MempoolAddTransactionStatusCode::Valid => Ok(()),
+        MempoolStatusCode::Accepted => Ok(()),
         _ => Err(format_err!("insertion failure")),
     }
+}
+
+pub(crate) fn batch_add_signed_txn(
+    pool: &mut CoreMempool,
+    transactions: Vec<SignedTransaction>,
+) -> Result<()> {
+    for txn in transactions.into_iter() {
+        if let Err(e) = add_signed_txn(pool, txn) {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 // helper struct that keeps state between `.get_block` calls. Imitates work of Consensus

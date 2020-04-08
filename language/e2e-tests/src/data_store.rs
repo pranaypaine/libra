@@ -4,60 +4,23 @@
 //! Support for mocking the Libra data store.
 
 use crate::account::AccountData;
-use failure::prelude::*;
-use lazy_static::lazy_static;
+use anyhow::Result;
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
     language_storage::ModuleId,
-    transaction::{Transaction, TransactionPayload},
+    transaction::ChangeSet,
     write_set::{WriteOp, WriteSet},
 };
-use std::{collections::HashMap, fs::File, io::prelude::*, path::PathBuf};
+use move_vm_state::data_cache::RemoteCache;
+use once_cell::sync::Lazy;
+use std::collections::HashMap;
 use vm::{errors::*, CompiledModule};
-use vm_runtime::data_cache::RemoteCache;
-use walkdir::WalkDir;
+use vm_genesis;
 
-lazy_static! {
-    /// The write set encoded in the genesis transaction.
-    pub static ref GENESIS_WRITE_SET: WriteSet = {
-        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.pop();
-        path.push("vm/vm-genesis/genesis/genesis.blob");
-
-        load_genesis(path)
-    };
-
-    pub static ref TESTNET_GENESIS: Vec<WriteSet> = {
-        let mut base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        base_path.pop();
-        base_path.pop();
-        base_path.push("terraform/validator-sets/");
-
-        let files = WalkDir::new(base_path)
-            .into_iter()
-            .filter_map(|f| f.ok())
-            .filter(|f| f.path().ends_with("genesis.blob"))
-            .map(|f| load_genesis(f.path().to_path_buf()))
-            .collect::<Vec<_>>();
-
-        assert!(!files.is_empty());
-        files
-    };
-}
-
-fn load_genesis(path: PathBuf) -> WriteSet {
-    let mut f = File::open(&path).unwrap();
-    let mut bytes = vec![];
-    f.read_to_end(&mut bytes).unwrap();
-    let txn = lcs::from_bytes(&bytes).unwrap();
-    if let Transaction::UserTransaction(txn) = txn {
-        if let TransactionPayload::WriteSet(ws) = txn.payload() {
-            return ws.write_set().clone();
-        }
-    }
-    panic!("Expected writeset txn in genesis txn");
-}
+/// Dummy genesis ChangeSet for testing
+pub static GENESIS_CHANGE_SET: Lazy<ChangeSet> =
+    Lazy::new(vm_genesis::generate_genesis_change_set_for_testing);
 
 /// An in-memory implementation of [`StateView`] and [`RemoteCache`] for the VM.
 ///
@@ -104,12 +67,8 @@ impl FakeDataStore {
 
     /// Adds an [`AccountData`] to this data store.
     pub fn add_account_data(&mut self, account_data: &AccountData) {
-        match account_data.to_resource().simple_serialize() {
-            Some(blob) => {
-                self.set(account_data.make_access_path(), blob);
-            }
-            None => panic!("can't create Account data"),
-        }
+        let write_set = account_data.to_writeset();
+        self.add_write_set(&write_set)
     }
 
     /// Adds a [`CompiledModule`] to this data store.

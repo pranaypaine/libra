@@ -12,16 +12,12 @@
 #![cfg_attr(not(feature = "fuzzing"), deny(missing_docs))]
 #![cfg_attr(feature = "fuzzing", allow(dead_code))]
 #![recursion_limit = "512"]
-extern crate failure;
-
-#[allow(unused_imports)]
-#[macro_use]
-extern crate debug_interface;
 
 #[macro_use]
 extern crate prometheus;
 
 mod chained_bft;
+pub use chained_bft::network_interface;
 
 mod util;
 

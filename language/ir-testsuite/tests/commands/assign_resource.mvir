@@ -1,0 +1,11 @@
+import 0x0.LBR;
+import 0x0.Libra;
+
+main() {
+    let z: Libra.T<LBR.T>;
+    z = Libra.zero<LBR.T>();
+    z = Libra.zero<LBR.T>();
+    return;
+}
+
+// check: STLOC_UNSAFE_TO_DESTROY_ERROR

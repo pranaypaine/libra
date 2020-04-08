@@ -17,9 +17,9 @@
 pub mod schema;
 
 use crate::schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec};
-use failure::prelude::*;
-use lazy_static::lazy_static;
+use anyhow::{bail, format_err, Result};
 use libra_metrics::OpMetrics;
+use once_cell::sync::Lazy;
 use rocksdb::{
     rocksdb_options::ColumnFamilyDescriptor, CFHandle, DBOptions, Writable, WriteOptions,
 };
@@ -30,9 +30,7 @@ use std::{
     path::Path,
 };
 
-lazy_static! {
-    static ref OP_COUNTER: OpMetrics = OpMetrics::new_and_registered("schemadb");
-}
+static OP_COUNTER: Lazy<OpMetrics> = Lazy::new(|| OpMetrics::new_and_registered("schemadb"));
 
 /// Type alias to `rocksdb::ColumnFamilyOptions`. See [`rocksdb doc`](https://github.com/pingcap/rust-rocksdb/blob/master/src/rocksdb_options.rs)
 pub type ColumnFamilyOptions = rocksdb::ColumnFamilyOptions;
@@ -110,13 +108,17 @@ where
     }
 
     /// Seeks to the first key.
-    pub fn seek_to_first(&mut self) -> bool {
-        self.db_iter.seek(rocksdb::SeekKey::Start)
+    pub fn seek_to_first(&mut self) -> Result<bool> {
+        self.db_iter
+            .seek(rocksdb::SeekKey::Start)
+            .map_err(convert_rocksdb_err)
     }
 
     /// Seeks to the last key.
-    pub fn seek_to_last(&mut self) -> bool {
-        self.db_iter.seek(rocksdb::SeekKey::End)
+    pub fn seek_to_last(&mut self) -> Result<bool> {
+        self.db_iter
+            .seek(rocksdb::SeekKey::End)
+            .map_err(convert_rocksdb_err)
     }
 
     /// Seeks to the first key whose binary representation is equal to or greater than that of the
@@ -126,7 +128,9 @@ where
         SK: SeekKeyCodec<S>,
     {
         let key = <SK as SeekKeyCodec<S>>::encode_seek_key(seek_key)?;
-        Ok(self.db_iter.seek(rocksdb::SeekKey::Key(&key)))
+        self.db_iter
+            .seek(rocksdb::SeekKey::Key(&key))
+            .map_err(convert_rocksdb_err)
     }
 
     /// Seeks to the last key whose binary representation is less than or equal to that of the
@@ -138,7 +142,22 @@ where
         SK: SeekKeyCodec<S>,
     {
         let key = <SK as SeekKeyCodec<S>>::encode_seek_key(seek_key)?;
-        Ok(self.db_iter.seek_for_prev(rocksdb::SeekKey::Key(&key)))
+        self.db_iter
+            .seek_for_prev(rocksdb::SeekKey::Key(&key))
+            .map_err(convert_rocksdb_err)
+    }
+
+    fn next_impl(&mut self) -> Result<Option<(S::Key, S::Value)>> {
+        if !self.db_iter.valid().map_err(convert_rocksdb_err)? {
+            return Ok(None);
+        }
+
+        let raw_key = self.db_iter.key();
+        let raw_value = self.db_iter.value();
+        let key = <S::Key as KeyCodec<S>>::decode_key(&raw_key)?;
+        let value = <S::Value as ValueCodec<S>>::decode_value(&raw_value)?;
+        self.db_iter.next().map_err(convert_rocksdb_err)?;
+        Ok(Some((key, value)))
     }
 }
 
@@ -149,13 +168,7 @@ where
     type Item = Result<(S::Key, S::Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.db_iter.kv().map(|(raw_key, raw_value)| {
-            self.db_iter.next();
-            Ok((
-                <S::Key as KeyCodec<S>>::decode_key(&raw_key)?,
-                <S::Value as ValueCodec<S>>::decode_value(&raw_value)?,
-            ))
-        })
+        self.next_impl().transpose()
     }
 }
 
@@ -167,8 +180,8 @@ fn db_exists(path: &Path) -> bool {
 }
 
 /// All the RocksDB methods return `std::result::Result<T, String>`. Since our methods return
-/// `failure::Result<T>`, manual conversion is needed.
-fn convert_rocksdb_err(msg: String) -> failure::Error {
+/// `anyhow::Result<T>`, manual conversion is needed.
+fn convert_rocksdb_err(msg: String) -> anyhow::Error {
     format_err!("RocksDB internal error: {}.", msg)
 }
 
@@ -211,6 +224,29 @@ impl DB {
         Ok(db)
     }
 
+    /// Open db in readonly mode
+    pub fn open_readonly<P: AsRef<Path>>(
+        path: P,
+        cf_opts_map: ColumnFamilyOptionsMap,
+        db_log_dir: P,
+    ) -> Result<Self> {
+        if !db_exists(path.as_ref()) {
+            bail!("DB doesn't exists.");
+        }
+
+        let mut db_opts = DBOptions::new();
+
+        db_opts.create_if_missing(false);
+        db_opts.set_db_log_dir(db_log_dir.as_ref().to_str().ok_or_else(|| {
+            format_err!(
+                "db_log_dir {:?} can not be converted to string.",
+                db_log_dir.as_ref()
+            )
+        })?);
+
+        DB::open_cf_readonly(db_opts, &path, cf_opts_map.into_iter().collect())
+    }
+
     fn open_cf<'a, P, T>(opts: DBOptions, path: P, cfds: Vec<T>) -> Result<DB>
     where
         P: AsRef<Path>,
@@ -222,6 +258,24 @@ impl DB {
                 format_err!("Path {:?} can not be converted to string.", path.as_ref())
             })?,
             cfds,
+        )
+        .map_err(convert_rocksdb_err)?;
+
+        Ok(DB { inner })
+    }
+
+    fn open_cf_readonly<'a, P, T>(opts: DBOptions, path: P, cfds: Vec<T>) -> Result<DB>
+    where
+        P: AsRef<Path>,
+        T: Into<ColumnFamilyDescriptor<'a>>,
+    {
+        let inner = rocksdb::DB::open_cf_for_read_only(
+            opts,
+            path.as_ref().to_str().ok_or_else(|| {
+                format_err!("Path {:?} can not be converted to string.", path.as_ref())
+            })?,
+            cfds,
+            false,
         )
         .map_err(convert_rocksdb_err)?;
 
@@ -265,7 +319,7 @@ impl DB {
 
     /// Delete all keys in range [begin, end).
     ///
-    /// `SK` has to be an explict type parameter since
+    /// `SK` has to be an explicit type parameter since
     /// https://github.com/rust-lang/rust/issues/44721
     pub fn range_delete<S, SK>(&self, begin: &SK, end: &SK) -> Result<()>
     where

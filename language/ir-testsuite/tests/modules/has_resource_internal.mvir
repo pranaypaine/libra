@@ -1,0 +1,21 @@
+// check: Missing struct definition for T
+
+module Token {
+    resource T { b: bool }
+    public new(): Self.T {
+        return T{ b: true };
+    }
+}
+
+//! new-transaction
+
+import {{default}}.Token;
+
+main() {
+    let sender: address;
+    let yes: bool;
+
+    sender = get_txn_sender();
+    yes = exists<T>(copy(sender));
+    return;
+}

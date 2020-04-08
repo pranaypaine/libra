@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use vm::file_format::{
-    AddressPoolIndex, ByteArrayPoolIndex, CodeOffset, FieldDefinitionIndex, FunctionHandleIndex,
-    LocalIndex, LocalsSignatureIndex, StructDefinitionIndex, UserStringIndex,
+    AddressPoolIndex, ByteArrayPoolIndex, CodeOffset, FunctionHandleIndex, SignatureIndex,
+    StructDefinitionIndex,
 };
 
-type TempIndex = usize;
+pub type TempIndex = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StacklessBytecode {
-    MoveLoc(TempIndex, LocalIndex),   // t = move(l)
-    CopyLoc(TempIndex, LocalIndex),   // t = copy(l)
-    StLoc(LocalIndex, TempIndex),     // l = t
-    BorrowLoc(TempIndex, LocalIndex), // t1 = &t2
+    MoveLoc(TempIndex, TempIndex),   // t = move(l)
+    CopyLoc(TempIndex, TempIndex),   // t = copy(l)
+    StLoc(TempIndex, TempIndex),     // l = t
+    BorrowLoc(TempIndex, TempIndex), // t1 = &t2
 
     ReadRef(TempIndex, TempIndex),   // t1 = *t2
     WriteRef(TempIndex, TempIndex),  // *t1 = t2
@@ -22,7 +22,7 @@ pub enum StacklessBytecode {
     Call(
         Vec<TempIndex>,
         FunctionHandleIndex,
-        LocalsSignatureIndex,
+        Option<SignatureIndex>,
         Vec<TempIndex>,
     ), /* t1_vec = call(index) with
         * t2_vec as parameters */
@@ -31,35 +31,35 @@ pub enum StacklessBytecode {
     Pack(
         TempIndex,
         StructDefinitionIndex,
-        LocalsSignatureIndex,
+        Option<SignatureIndex>,
         Vec<TempIndex>,
     ), /* t1 = struct(index) with t2_vec
         * as fields */
     Unpack(
         Vec<TempIndex>,
         StructDefinitionIndex,
-        LocalsSignatureIndex,
+        Option<SignatureIndex>,
         TempIndex,
     ), // t1_vec = t2's fields
-    BorrowField(TempIndex, TempIndex, FieldDefinitionIndex), // t1 = t2.field
-    MoveToSender(TempIndex, StructDefinitionIndex, LocalsSignatureIndex), /* move_to_sender<struct_index>(t) */
+    BorrowField(TempIndex, TempIndex, StructDefinitionIndex, TempIndex), // t1 = t2.field
+    MoveToSender(TempIndex, StructDefinitionIndex, Option<SignatureIndex>), /* move_to_sender<struct_index>(t) */
     MoveFrom(
         TempIndex,
         TempIndex,
         StructDefinitionIndex,
-        LocalsSignatureIndex,
+        Option<SignatureIndex>,
     ), /* t1 = move_from<struct_index>(t2) */
     BorrowGlobal(
         TempIndex,
         TempIndex,
         StructDefinitionIndex,
-        LocalsSignatureIndex,
+        Option<SignatureIndex>,
     ), /* t1 = borrow_global<struct_index>(t2) */
     Exists(
         TempIndex,
         TempIndex,
         StructDefinitionIndex,
-        LocalsSignatureIndex,
+        Option<SignatureIndex>,
     ), /* t1 = exists<struct_index>(t2) */
 
     GetGasRemaining(TempIndex),
@@ -71,10 +71,15 @@ pub enum StacklessBytecode {
 
     LdTrue(TempIndex),
     LdFalse(TempIndex),
-    LdConst(TempIndex, u64),
+    LdU8(TempIndex, u8),
+    LdU64(TempIndex, u64),
+    LdU128(TempIndex, u128),
     LdAddr(TempIndex, AddressPoolIndex),
     LdByteArray(TempIndex, ByteArrayPoolIndex),
-    LdStr(TempIndex, UserStringIndex),
+
+    CastU8(TempIndex, TempIndex),
+    CastU64(TempIndex, TempIndex),
+    CastU128(TempIndex, TempIndex),
 
     Not(TempIndex, TempIndex),            // t1 = !t2
     Add(TempIndex, TempIndex, TempIndex), // t1 = t2 binop t3
@@ -85,6 +90,8 @@ pub enum StacklessBytecode {
     BitOr(TempIndex, TempIndex, TempIndex),
     BitAnd(TempIndex, TempIndex, TempIndex),
     Xor(TempIndex, TempIndex, TempIndex),
+    Shl(TempIndex, TempIndex, TempIndex),
+    Shr(TempIndex, TempIndex, TempIndex),
     Lt(TempIndex, TempIndex, TempIndex),
     Gt(TempIndex, TempIndex, TempIndex),
     Le(TempIndex, TempIndex, TempIndex),
@@ -99,5 +106,62 @@ pub enum StacklessBytecode {
     BrFalse(CodeOffset, TempIndex), // if(!t) goto code_offset
 
     Abort(TempIndex), // abort t
-    NoOp,
+    Pop(TempIndex),
+}
+
+impl StacklessBytecode {
+    pub fn is_unconditional_branch(&self) -> bool {
+        matches!(
+            self,
+            StacklessBytecode::Ret(_) | StacklessBytecode::Abort(_) | StacklessBytecode::Branch(_)
+        )
+    }
+
+    pub fn is_conditional_branch(&self) -> bool {
+        matches!(
+            self,
+            StacklessBytecode::BrFalse(_, _) | StacklessBytecode::BrTrue(_, _)
+        )
+    }
+
+    pub fn is_branch(&self) -> bool {
+        self.is_conditional_branch() || self.is_unconditional_branch()
+    }
+
+    /// Return the destination of branching if self is a branching instruction
+    pub fn branch_dest(&self) -> Option<&CodeOffset> {
+        match self {
+            StacklessBytecode::BrFalse(offset, _)
+            | StacklessBytecode::BrTrue(offset, _)
+            | StacklessBytecode::Branch(offset) => Some(offset),
+            _ => None,
+        }
+    }
+
+    /// Return the successor offsets of this instruction
+    pub fn get_successors(pc: CodeOffset, code: &[StacklessBytecode]) -> Vec<CodeOffset> {
+        let bytecode = &code[pc as usize];
+        let mut v = vec![];
+
+        if let Some(offset) = bytecode.branch_dest() {
+            v.push(*offset);
+        }
+
+        let next_pc = pc + 1;
+        if next_pc >= code.len() as CodeOffset {
+            return v;
+        }
+
+        if !bytecode.is_unconditional_branch() && !v.contains(&next_pc) {
+            // avoid duplicates
+            v.push(next_pc);
+        }
+
+        // always give successors in ascending order
+        if v.len() > 1 && v[0] > v[1] {
+            v.swap(0, 1);
+        }
+
+        v
+    }
 }

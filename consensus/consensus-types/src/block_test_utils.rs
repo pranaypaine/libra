@@ -5,16 +5,20 @@ use crate::{
     block::Block, block_data::BlockData, common::Round, quorum_cert::QuorumCert,
     vote_data::VoteData,
 };
-use libra_crypto::hash::{CryptoHash, HashValue};
+use libra_crypto::{
+    ed25519::Ed25519PrivateKey,
+    hash::{CryptoHash, HashValue},
+};
 use libra_types::{
     block_info::BlockInfo,
-    crypto_proxies::{SecretKey, ValidatorSigner},
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    validator_signer::proptests,
+    validator_signer::{proptests, ValidatorSigner},
 };
 use proptest::prelude::*;
-use std::collections::BTreeMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 type LinearizedBlockForest<T> = Vec<Block<T>>;
 
@@ -145,7 +149,7 @@ prop_compose! {
 /// vector
 fn block_forest_from_keys(
     depth: u32,
-    keypairs: Vec<SecretKey>,
+    keypairs: Vec<Ed25519PrivateKey>,
 ) -> impl Strategy<Value = LinearizedBlockForest<Vec<usize>>> {
     let leaf = leaf_strategy().prop_map(|block| vec![block]);
     // Note that having `expected_branch_size` of 1 seems to generate significantly larger trees
@@ -160,7 +164,7 @@ fn block_forest_from_keys(
 pub fn block_forest_and_its_keys(
     quorum_size: usize,
     depth: u32,
-) -> impl Strategy<Value = (Vec<SecretKey>, LinearizedBlockForest<Vec<usize>>)> {
+) -> impl Strategy<Value = (Vec<Ed25519PrivateKey>, LinearizedBlockForest<Vec<usize>>)> {
     proptest::collection::vec(proptests::arb_signing_key(), quorum_size).prop_flat_map(
         move |private_key| {
             (
@@ -183,38 +187,31 @@ pub fn placeholder_ledger_info() -> LedgerInfo {
     LedgerInfo::new(BlockInfo::empty(), HashValue::zero())
 }
 
-pub fn placeholder_ledger_with_id(id: HashValue) -> LedgerInfo {
-    LedgerInfo::new(
-        BlockInfo::new(0, 0, id, HashValue::zero(), 0, 0, None),
-        HashValue::zero(),
-    )
-}
-
 pub fn gen_test_certificate(
     signers: Vec<&ValidatorSigner>,
     block: BlockInfo,
     parent_block: BlockInfo,
-    committed_block_id: Option<HashValue>,
+    committed_block: Option<BlockInfo>,
 ) -> QuorumCert {
-    let vote_data = VoteData::new(block.clone(), parent_block.clone());
-    let mut ledger_info_placeholder = match committed_block_id {
-        Some(id) => placeholder_ledger_with_id(id),
-        None => placeholder_ledger_info(),
+    let vote_data = VoteData::new(block, parent_block);
+    let ledger_info = match committed_block {
+        Some(info) => LedgerInfo::new(info, vote_data.hash()),
+        None => {
+            let mut placeholder = placeholder_ledger_info();
+            placeholder.set_consensus_data_hash(vote_data.hash());
+            placeholder
+        }
     };
-
-    ledger_info_placeholder.set_consensus_data_hash(vote_data.hash());
 
     let mut signatures = BTreeMap::new();
     for signer in signers {
-        let li_sig = signer
-            .sign_message(ledger_info_placeholder.hash())
-            .expect("Failed to sign LedgerInfo");
+        let li_sig = signer.sign_message(ledger_info.hash());
         signatures.insert(signer.author(), li_sig);
     }
 
     QuorumCert::new(
         vote_data,
-        LedgerInfoWithSignatures::new(ledger_info_placeholder, signatures),
+        LedgerInfoWithSignatures::new(ledger_info, signatures),
     )
 }
 
@@ -224,10 +221,9 @@ pub fn placeholder_certificate_for_block(
     certified_block_round: u64,
     certified_parent_block_id: HashValue,
     certified_parent_block_round: u64,
-    consensus_block_id: Option<HashValue>,
 ) -> QuorumCert {
     // Assuming executed state to be Genesis state.
-    let genesis_ledger_info = LedgerInfo::genesis();
+    let genesis_ledger_info = LedgerInfo::mock_genesis();
     let vote_data = VoteData::new(
         BlockInfo::new(
             genesis_ledger_info.epoch() + 1,
@@ -251,18 +247,13 @@ pub fn placeholder_certificate_for_block(
 
     // This ledger info doesn't carry any meaningful information: it is all zeros except for
     // the consensus data hash that carries the actual vote.
-    let mut ledger_info_placeholder = match consensus_block_id {
-        Some(id) => placeholder_ledger_with_id(id),
-        None => placeholder_ledger_info(),
-    };
+    let mut ledger_info_placeholder = placeholder_ledger_info();
 
     ledger_info_placeholder.set_consensus_data_hash(vote_data.hash());
 
     let mut signatures = BTreeMap::new();
     for signer in signers {
-        let li_sig = signer
-            .sign_message(ledger_info_placeholder.hash())
-            .expect("Failed to sign LedgerInfo");
+        let li_sig = signer.sign_message(ledger_info_placeholder.hash());
         signatures.insert(signer.author(), li_sig);
     }
 
@@ -273,7 +264,7 @@ pub fn placeholder_certificate_for_block(
 }
 
 pub fn certificate_for_genesis() -> QuorumCert {
-    let ledger_info = LedgerInfo::genesis();
+    let ledger_info = LedgerInfo::mock_genesis();
     QuorumCert::certificate_for_genesis_from_ledger_info(
         &ledger_info,
         Block::<Vec<usize>>::make_genesis_block_from_ledger_info(&ledger_info).id(),

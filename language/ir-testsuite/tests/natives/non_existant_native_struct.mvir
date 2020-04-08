@@ -1,0 +1,7 @@
+module M {
+    native struct T;
+    native resource T2;
+}
+
+// check: MISSING_DEPENDENCY
+// check: MISSING_DEPENDENCY

@@ -3,36 +3,34 @@
 
 #![forbid(unsafe_code)]
 
-#[macro_use]
-pub mod shared;
-
-pub mod errors;
+#[macro_use(sp)]
+extern crate move_ir_types;
 
 pub mod cfgir;
+pub mod command_line;
+pub mod compiled_unit;
+pub mod errors;
 pub mod expansion;
 pub mod hlir;
+pub mod ir_translation;
 pub mod naming;
 pub mod parser;
-pub mod to_bytecode;
+pub mod shared;
+pub mod test_utils;
+mod to_bytecode;
 pub mod typing;
 
-pub mod command_line;
-
-pub mod test_utils;
-
 use codespan::{ByteIndex, Span};
+use compiled_unit::CompiledUnit;
 use errors::*;
-use lalrpop_util::ParseError;
-use shared::{Address, Loc};
+use move_ir_types::location::*;
+use parser::syntax::parse_file_string;
+use shared::Address;
 use std::{
     collections::HashMap,
     fs::File,
     io::{self, Read, Write},
 };
-
-// fn run(_targets: &[&str], _deps: &[&str]) -> io::Result<()> {
-//     panic!()
-// }
 
 //**************************************************************************************************
 // Entry
@@ -44,8 +42,8 @@ use std::{
 /// Very large programs might fail on compilation even though they have been checked due to size
 ///   limitations of the Move bytecode
 pub fn move_check(
-    targets: &[&'static str],
-    deps: &[&'static str],
+    targets: &[String],
+    deps: &[String],
     sender_opt: Option<Address>,
 ) -> io::Result<()> {
     let (files, errors) = move_check_no_report(targets, deps, sender_opt)?;
@@ -57,8 +55,8 @@ pub fn move_check(
 
 /// Move check but it returns the errors instead of reporting them to stderr
 pub fn move_check_no_report(
-    targets: &[&'static str],
-    deps: &[&'static str],
+    targets: &[String],
+    deps: &[String],
     sender_opt: Option<Address>,
 ) -> io::Result<(FilesSourceText, Errors)> {
     let (files, pprog_res) = parse_program(targets, deps)?;
@@ -74,10 +72,10 @@ pub fn move_check_no_report(
 /// Does not run the Move bytecode verifier on the compiled targets, as the Move front end should
 ///   be more restrictive
 pub fn move_compile(
-    targets: &[&'static str],
-    deps: &[&'static str],
+    targets: &[String],
+    deps: &[String],
     sender_opt: Option<Address>,
-) -> io::Result<(FilesSourceText, Vec<to_bytecode::translate::CompiledUnit>)> {
+) -> io::Result<(FilesSourceText, Vec<CompiledUnit>)> {
     let (files, pprog_res) = parse_program(targets, deps)?;
     match compile_program(pprog_res, sender_opt) {
         Err(errors) => errors::report_errors(files, errors),
@@ -85,13 +83,42 @@ pub fn move_compile(
     }
 }
 
+/// Move check but it returns the errors instead of reporting them to stderr
+pub fn move_compile_no_report(
+    targets: &[String],
+    deps: &[String],
+    sender_opt: Option<Address>,
+) -> io::Result<(FilesSourceText, Result<Vec<CompiledUnit>, Errors>)> {
+    let (files, pprog_res) = parse_program(targets, deps)?;
+    Ok(match compile_program(pprog_res, sender_opt) {
+        Err(errors) => (files, Err(errors)),
+        Ok(units) => (files, Ok(units)),
+    })
+}
+
+/// Move compile up to expansion phase, returning errors instead of reporting them to stderr
+pub fn move_compile_to_expansion_no_report(
+    targets: &[String],
+    deps: &[String],
+    sender_opt: Option<Address>,
+) -> io::Result<(FilesSourceText, Result<expansion::ast::Program, Errors>)> {
+    let (files, pprog_res) = parse_program(targets, deps)?;
+    let res = pprog_res.and_then(|pprog| {
+        let (eprog, errors) = expansion::translate::program(pprog, sender_opt);
+        check_errors(errors)?;
+        Ok(eprog)
+    });
+    Ok((files, res))
+}
+
+//**************************************************************************************************
+// Utils
+//**************************************************************************************************
+
 /// Runs the bytecode verifier on the compiled units
 /// Fails if the bytecode verifier errors
-pub fn sanity_check_compiled_units(
-    files: FilesSourceText,
-    compiled_units: Vec<to_bytecode::translate::CompiledUnit>,
-) {
-    let (_, ice_errors) = to_bytecode::translate::verify_units(compiled_units);
+pub fn sanity_check_compiled_units(files: FilesSourceText, compiled_units: Vec<CompiledUnit>) {
+    let (_, ice_errors) = compiled_unit::verify_units(compiled_units);
     if !ice_errors.is_empty() {
         errors::report_errors(files, ice_errors)
     }
@@ -100,11 +127,11 @@ pub fn sanity_check_compiled_units(
 /// Given a file map and a set of compiled programs, saves the compiled programs to disk
 pub fn output_compiled_units(
     files: FilesSourceText,
-    compiled_units: Vec<to_bytecode::translate::CompiledUnit>,
+    compiled_units: Vec<CompiledUnit>,
     out_dir: &str,
 ) -> io::Result<()> {
     std::fs::create_dir_all(out_dir)?;
-    let (compiled_units, ice_errors) = to_bytecode::translate::verify_units(compiled_units);
+    let (compiled_units, ice_errors) = compiled_unit::verify_units(compiled_units);
     let files_and_units = compiled_units
         .into_iter()
         .enumerate()
@@ -128,6 +155,10 @@ pub fn output_compiled_units(
     Ok(())
 }
 
+//**************************************************************************************************
+// Translations
+//**************************************************************************************************
+
 fn check_program(
     prog: Result<parser::ast::Program, Errors>,
     sender_opt: Option<Address>,
@@ -145,79 +176,27 @@ fn check_program(
 fn compile_program(
     prog: Result<parser::ast::Program, Errors>,
     sender_opt: Option<Address>,
-) -> Result<Vec<to_bytecode::translate::CompiledUnit>, Errors> {
+) -> Result<Vec<CompiledUnit>, Errors> {
     let cprog = check_program(prog, sender_opt)?;
     to_bytecode::translate::program(cprog)
-}
-
-fn check_errors(errors: Errors) -> Result<(), Errors> {
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
 }
 
 //**************************************************************************************************
 // Parsing
 //**************************************************************************************************
 
-fn parsing_error<Token>(
-    fname: &'static str,
-    e: lalrpop_util::ParseError<usize, Token, &'static str>,
-) -> Error
-where
-    Token: std::fmt::Display,
-{
-    let fmt_expected = |expected: Vec<String>| -> String {
-        format!(
-            "Expected: {}",
-            expected
-                .iter()
-                .fold(String::new(), |acc, token| format!("{} {},", acc, token))
-        )
-    };
-    match e {
-        ParseError::InvalidToken { location: l } => {
-            let span = Span::new(ByteIndex(l as u32), ByteIndex(l as u32));
-            let loc = Loc::new(fname, span);
-            vec![(loc, "Invalid Token".into())]
-        }
-        ParseError::UnrecognizedToken {
-            token: (l, tok, r),
-            expected,
-        } => {
-            let span = Span::new(ByteIndex(l as u32), ByteIndex(r as u32));
-            let loc = Loc::new(fname, span);
-            vec![
-                (loc, format!("Unrecognized Token: {}", tok)),
-                (loc, fmt_expected(expected)),
-            ]
-        }
-        ParseError::UnrecognizedEOF {
-            location: l,
-            expected,
-        } => {
-            let span = Span::new(ByteIndex(l as u32), ByteIndex(l as u32));
-            let loc = Loc::new(fname, span);
-            vec![
-                (loc, "Unrecognized End of File".into()),
-                (loc, fmt_expected(expected)),
-            ]
-        }
-        ParseError::ExtraToken { token: (l, tok, r) } => {
-            let span = Span::new(ByteIndex(l as u32), ByteIndex(r as u32));
-            let loc = Loc::new(fname, span);
-            vec![(loc, format!("Unexpected Extra Token: {}", tok))]
-        }
-        ParseError::User { error: e } => panic!("ICE unimplemented display for parse error: {}", e),
-    }
-}
-
 fn parse_program(
-    targets: &[&'static str],
-    deps: &[&'static str],
+    targets: &[String],
+    deps: &[String],
 ) -> io::Result<(FilesSourceText, Result<parser::ast::Program, Errors>)> {
+    let targets = targets
+        .iter()
+        .map(|s| leak_str(s))
+        .collect::<Vec<&'static str>>();
+    let deps = deps
+        .iter()
+        .map(|s| leak_str(s))
+        .collect::<Vec<&'static str>>();
     let mut files: FilesSourceText = HashMap::new();
     let mut source_definitions = Vec::new();
     let mut lib_definitions = Vec::new();
@@ -250,26 +229,32 @@ fn parse_program(
     Ok((files, res))
 }
 
+// TODO replace with some sort of intern table
+fn leak_str(s: &str) -> &'static str {
+    Box::leak(Box::new(s.to_owned()))
+}
+
 fn parse_file(
     files: &mut FilesSourceText,
     fname: &'static str,
 ) -> io::Result<(Option<parser::ast::FileDefinition>, Errors)> {
     let mut errors: Errors = Vec::new();
-    let parser = parser::syntax::FileParser::new();
-    let mut f = File::open(fname)?;
+    let mut f = File::open(fname)
+        .map_err(|err| std::io::Error::new(err.kind(), format!("{}: {}", err, fname)))?;
     let mut source_buffer = String::new();
     f.read_to_string(&mut source_buffer)?;
     let no_comments_buffer = match strip_comments_and_verify(fname, &source_buffer) {
         Err(err) => {
             errors.push(err);
+            files.insert(fname, source_buffer);
             return Ok((None, errors));
         }
         Ok(no_comments_buffer) => no_comments_buffer,
     };
-    let def_opt = match parser.parse(fname, &no_comments_buffer) {
+    let def_opt = match parse_file_string(fname, &no_comments_buffer) {
         Ok(def) => Some(def),
         Err(err) => {
-            errors.push(parsing_error(fname, err));
+            errors.push(err);
             None
         }
     };
@@ -320,8 +305,9 @@ fn verify_string(fname: &'static str, string: &str) -> Result<(), Error> {
             let span = Span::new(ByteIndex(idx as u32), ByteIndex(idx as u32));
             let loc = Loc::new(fname, span);
             let msg = format!(
-                "Parser Error: invalid character {} found when reading file.\
-                 Only ascii printable, tabs (\\t), and \\n line ending characters are permitted.",
+                "Invalid character '{}' found when reading file. \
+                 Only ASCII printable characters, tabs (\\t), and line endings (\\n) \
+                 are permitted.",
                 chr
             );
             Err(vec![(loc, msg)])

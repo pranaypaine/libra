@@ -3,26 +3,31 @@ name = "move-lang"
 version = "0.0.1"
 authors = ["Libra <oncall+libra@xmail.facebook.com>"]
 publish = false
-build = "build.rs"
 edition = "2018"
 
 [dependencies]
-codespan = "0.5.0"
-codespan-reporting = "0.5.0"
-hex = "0.3.2"
-regex = "1.1.6"
-lalrpop-util = "0.17.1"
-structopt = "0.3.3"
-text-diff = "0.4.0"
+codespan = "0.8.0"
+codespan-reporting = "0.8.0"
+hex = "0.4.2"
+regex = "1.3.6"
+structopt = "0.3.12"
+difference = "2.0"
+petgraph = "0.5.0"
 datatest-stable = { path = "../../common/datatest-stable", version = "0.1.0" }
 
 move-vm = { path = "../vm", package = "vm" }
 move-bytecode-verifier = { path = "../bytecode-verifier", package = "bytecode-verifier" }
 libra-types = { path = "../../types" }
+move-ir-types = {path = "../move-ir/types" }
+ir-to-bytecode = {path = "../compiler/ir-to-bytecode" }
 borrow-graph = { path = "../borrow-graph" }
+bytecode-source-map = { path = "../compiler/bytecode-source-map" }
 
-[build-dependencies]
-lalrpop = "0.17.1"
+
+[dev-dependencies]
+anyhow = "1.0"
+functional-tests = { path = "../functional-tests", version = "0.1.0" }
+tempfile = "3.1.0"
 
 [[test]]
 name = "move_check_testsuite"
@@ -31,3 +36,11 @@ harness = false
 [[test]]
 name = "stdlib_sanity_check"
 harness = false
+
+[[test]]
+name = "functional_testsuite"
+harness = false
+
+[[test]]
+name = "ir_test_coverage"
+harness = true

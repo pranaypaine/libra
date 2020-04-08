@@ -1,0 +1,13 @@
+module M {
+    import 0x0.Vector;
+
+    resource R { b: bool}
+
+    f() {
+        let v: vector<Self.R>;
+        v = Vector.empty<Self.R>();
+        return;
+    }
+}
+
+// check: RET_UNSAFE_TO_DESTROY_ERROR

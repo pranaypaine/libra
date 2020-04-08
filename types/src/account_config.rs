@@ -1,33 +1,51 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 use crate::{
     access_path::{AccessPath, Accesses},
     account_address::AccountAddress,
-    account_state_blob::AccountStateBlob,
-    byte_array::ByteArray,
     event::EventHandle,
-    identifier::{IdentStr, Identifier},
-    language_storage::StructTag,
+    language_storage::{ModuleId, StructTag, TypeTag},
 };
-use failure::prelude::*;
-use lazy_static::lazy_static;
+use anyhow::Result;
+use move_core_types::identifier::{IdentStr, Identifier};
+use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, convert::TryInto};
 
-lazy_static! {
-    // LibraCoin
-    static ref COIN_MODULE_NAME: Identifier = Identifier::new("LibraCoin").unwrap();
-    static ref COIN_STRUCT_NAME: Identifier = Identifier::new("T").unwrap();
+// Libra
+static COIN_MODULE_NAME: Lazy<Identifier> = Lazy::new(|| Identifier::new("Libra").unwrap());
+static COIN_STRUCT_NAME: Lazy<Identifier> = Lazy::new(|| Identifier::new("T").unwrap());
+pub static COIN_MODULE: Lazy<ModuleId> =
+    Lazy::new(|| ModuleId::new(CORE_CODE_ADDRESS, COIN_MODULE_NAME.clone()));
 
-    // Account
-    static ref ACCOUNT_MODULE_NAME: Identifier = Identifier::new("LibraAccount").unwrap();
-    static ref ACCOUNT_STRUCT_NAME: Identifier = Identifier::new("T").unwrap();
-}
+// LBR
+static LBR_MODULE_NAME: Lazy<Identifier> = Lazy::new(|| Identifier::new("LBR").unwrap());
+static LBR_STRUCT_NAME: Lazy<Identifier> = Lazy::new(|| Identifier::new("T").unwrap());
+pub static LBR_MODULE: Lazy<ModuleId> =
+    Lazy::new(|| ModuleId::new(CORE_CODE_ADDRESS, LBR_MODULE_NAME.clone()));
+
+// Account
+static ACCOUNT_MODULE_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("LibraAccount").unwrap());
+static ACCOUNT_STRUCT_NAME: Lazy<Identifier> = Lazy::new(|| Identifier::new("T").unwrap());
+static ACCOUNT_BALANCE_STRUCT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("Balance").unwrap());
+static ACCOUNT_EVENT_HANDLE_STRUCT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("EventHandle").unwrap());
+static ACCOUNT_EVENT_HANDLE_GENERATOR_STRUCT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("EventHandleGenerator").unwrap());
+
+/// The ModuleId for the Account module.
+pub static ACCOUNT_MODULE: Lazy<ModuleId> =
+    Lazy::new(|| ModuleId::new(CORE_CODE_ADDRESS, ACCOUNT_MODULE_NAME.clone()));
+
+// Payment Events
+static SENT_EVENT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("SentPaymentEvent").unwrap());
+static RECEIVED_EVENT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("ReceivedPaymentEvent").unwrap());
 
 pub fn coin_module_name() -> &'static IdentStr {
     &*COIN_MODULE_NAME
@@ -45,9 +63,35 @@ pub fn account_struct_name() -> &'static IdentStr {
     &*ACCOUNT_STRUCT_NAME
 }
 
-pub fn core_code_address() -> AccountAddress {
-    AccountAddress::default()
+pub fn account_balance_struct_name() -> &'static IdentStr {
+    &*ACCOUNT_BALANCE_STRUCT_NAME
 }
+
+pub fn lbr_module_name() -> &'static IdentStr {
+    &*LBR_MODULE_NAME
+}
+
+pub fn lbr_struct_name() -> &'static IdentStr {
+    &*LBR_STRUCT_NAME
+}
+
+pub fn account_event_handle_struct_name() -> &'static IdentStr {
+    &*ACCOUNT_EVENT_HANDLE_STRUCT_NAME
+}
+
+pub fn account_event_handle_generator_struct_name() -> &'static IdentStr {
+    &*ACCOUNT_EVENT_HANDLE_GENERATOR_STRUCT_NAME
+}
+
+pub fn sent_event_name() -> &'static IdentStr {
+    &*SENT_EVENT_NAME
+}
+
+pub fn received_event_name() -> &'static IdentStr {
+    &*RECEIVED_EVENT_NAME
+}
+
+pub const CORE_CODE_ADDRESS: AccountAddress = AccountAddress::DEFAULT;
 
 pub fn association_address() -> AccountAddress {
     AccountAddress::from_hex_literal("0xA550C18")
@@ -64,22 +108,66 @@ pub fn validator_set_address() -> AccountAddress {
         .expect("Parsing valid hex literal should always succeed")
 }
 
+pub fn discovery_set_address() -> AccountAddress {
+    AccountAddress::from_hex_literal("0xD15C0")
+        .expect("Parsing valid hex literal should always succeed")
+}
+
 pub fn account_struct_tag() -> StructTag {
     StructTag {
-        address: core_code_address(),
+        address: CORE_CODE_ADDRESS,
         module: account_module_name().to_owned(),
         name: account_struct_name().to_owned(),
         type_params: vec![],
     }
 }
 
+pub fn account_balance_struct_tag() -> StructTag {
+    StructTag {
+        address: CORE_CODE_ADDRESS,
+        module: account_module_name().to_owned(),
+        name: account_balance_struct_name().to_owned(),
+        type_params: vec![lbr_type_tag()],
+    }
+}
+
+pub fn lbr_type_tag() -> TypeTag {
+    TypeTag::Struct(lbr_struct_tag())
+}
+
+pub fn lbr_struct_tag() -> StructTag {
+    StructTag {
+        address: CORE_CODE_ADDRESS,
+        module: lbr_module_name().to_owned(),
+        name: lbr_struct_name().to_owned(),
+        type_params: vec![],
+    }
+}
+
+pub fn sent_payment_tag() -> StructTag {
+    StructTag {
+        address: CORE_CODE_ADDRESS,
+        module: account_module_name().to_owned(),
+        name: sent_event_name().to_owned(),
+        type_params: vec![],
+    }
+}
+
+pub fn received_payment_tag() -> StructTag {
+    StructTag {
+        address: CORE_CODE_ADDRESS,
+        module: account_module_name().to_owned(),
+        name: received_event_name().to_owned(),
+        type_params: vec![],
+    }
+}
+
 /// A Rust representation of an Account resource.
 /// This is not how the Account is represented in the VM but it's a convenient representation.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct AccountResource {
-    authentication_key: ByteArray,
-    balance: u64,
+    authentication_key: Vec<u8>,
     delegated_key_rotation_capability: bool,
     delegated_withdrawal_capability: bool,
     received_events: EventHandle,
@@ -91,9 +179,8 @@ pub struct AccountResource {
 impl AccountResource {
     /// Constructs an Account resource.
     pub fn new(
-        balance: u64,
         sequence_number: u64,
-        authentication_key: ByteArray,
+        authentication_key: Vec<u8>,
         delegated_key_rotation_capability: bool,
         delegated_withdrawal_capability: bool,
         sent_events: EventHandle,
@@ -101,7 +188,6 @@ impl AccountResource {
         event_generator: u64,
     ) -> Self {
         AccountResource {
-            balance,
             sequence_number,
             authentication_key,
             delegated_key_rotation_capability,
@@ -112,27 +198,13 @@ impl AccountResource {
         }
     }
 
-    /// Given an account map (typically from storage) retrieves the Account resource associated.
-    pub fn make_from(account_map: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<Self> {
-        let ap = account_resource_path();
-        match account_map.get(&ap) {
-            Some(bytes) => lcs::from_bytes(bytes).map_err(Into::into),
-            None => bail!("No data for {:?}", ap),
-        }
-    }
-
     /// Return the sequence_number field for the given AccountResource
     pub fn sequence_number(&self) -> u64 {
         self.sequence_number
     }
 
-    /// Return the balance field for the given AccountResource
-    pub fn balance(&self) -> u64 {
-        self.balance
-    }
-
     /// Return the authentication_key field for the given AccountResource
-    pub fn authentication_key(&self) -> &ByteArray {
+    pub fn authentication_key(&self) -> &[u8] {
         &self.authentication_key
     }
 
@@ -155,81 +227,114 @@ impl AccountResource {
     pub fn delegated_withdrawal_capability(&self) -> bool {
         self.delegated_withdrawal_capability
     }
+}
 
-    pub fn get_event_handle_by_query_path(&self, query_path: &[u8]) -> Result<&EventHandle> {
-        if *ACCOUNT_RECEIVED_EVENT_PATH == query_path {
-            Ok(&self.received_events)
-        } else if *ACCOUNT_SENT_EVENT_PATH == query_path {
-            Ok(&self.sent_events)
-        } else {
-            bail!("Unrecognized query path: {:?}", query_path);
-        }
+/// The balance resource held under an account.
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+pub struct BalanceResource {
+    coin: u64,
+}
+
+impl BalanceResource {
+    pub fn new(coin: u64) -> Self {
+        Self { coin }
+    }
+
+    pub fn coin(&self) -> u64 {
+        self.coin
     }
 }
 
-pub fn get_account_resource_or_default(
-    account_state: &Option<AccountStateBlob>,
-) -> Result<AccountResource> {
-    match account_state {
-        Some(blob) => {
-            let account_btree = blob.try_into()?;
-            AccountResource::make_from(&account_btree)
-        }
-        None => Ok(AccountResource::default()),
-    }
-}
+/// Path to the Account resource.
+/// It can be used to create an AccessPath for an Account resource.
+pub static ACCOUNT_RESOURCE_PATH: Lazy<Vec<u8>> =
+    Lazy::new(|| AccessPath::resource_access_vec(&account_struct_tag(), &Accesses::empty()));
 
-/// Return the path to the Account resource. It can be used to create an AccessPath for an
-/// Account resource.
-pub fn account_resource_path() -> Vec<u8> {
-    AccessPath::resource_access_vec(&account_struct_tag(), &Accesses::empty())
-}
+/// Path to the Balance resource
+pub static BALANCE_RESOURCE_PATH: Lazy<Vec<u8>> = Lazy::new(|| {
+    AccessPath::resource_access_vec(&account_balance_struct_tag(), &Accesses::empty())
+});
 
-lazy_static! {
-    /// The path to the sent event counter for an Account resource.
-    /// It can be used to query the event DB for the given event.
-    pub static ref ACCOUNT_SENT_EVENT_PATH: Vec<u8> = {
-        let mut path = account_resource_path();
-        path.extend_from_slice(b"/sent_events_count/");
-        path
-    };
+/// The path to the sent event counter for an Account resource.
+/// It can be used to query the event DB for the given event.
+pub static ACCOUNT_SENT_EVENT_PATH: Lazy<Vec<u8>> = Lazy::new(|| {
+    let mut path = ACCOUNT_RESOURCE_PATH.to_vec();
+    path.extend_from_slice(b"/sent_events_count/");
+    path
+});
 
-    /// Returns the path to the received event counter for an Account resource.
-    /// It can be used to query the event DB for the given event.
-    pub static ref ACCOUNT_RECEIVED_EVENT_PATH: Vec<u8> = {
-        let mut path = account_resource_path();
-        path.extend_from_slice(b"/received_events_count/");
-        path
-    };
-}
+/// Returns the path to the received event counter for an Account resource.
+/// It can be used to query the event DB for the given event.
+pub static ACCOUNT_RECEIVED_EVENT_PATH: Lazy<Vec<u8>> = Lazy::new(|| {
+    let mut path = ACCOUNT_RESOURCE_PATH.to_vec();
+    path.extend_from_slice(b"/received_events_count/");
+    path
+});
 
-/// Generic struct that represents an Account event.
-/// Both SentPaymentEvent and ReceivedPaymentEvent are representable with this struct.
-/// They have an AccountAddress for the sender or receiver, the amount transferred, and metadata.
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct AccountEvent {
+/// Struct that represents a SentPaymentEvent.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SentPaymentEvent {
     amount: u64,
-    account: AccountAddress,
+    receiver: AccountAddress,
     metadata: Vec<u8>,
 }
 
-impl AccountEvent {
+impl SentPaymentEvent {
     // TODO: should only be used for libra client testing and be removed eventually
-    pub fn new(amount: u64, account: AccountAddress, metadata: Vec<u8>) -> Self {
+    pub fn new(amount: u64, receiver: AccountAddress, metadata: Vec<u8>) -> Self {
         Self {
             amount,
-            account,
+            receiver,
             metadata,
         }
     }
 
-    pub fn try_from(bytes: &[u8]) -> Result<AccountEvent> {
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self> {
         lcs::from_bytes(bytes).map_err(Into::into)
     }
 
-    /// Get the account related to the event
-    pub fn account(&self) -> AccountAddress {
-        self.account
+    /// Get the sender of this transaction event.
+    pub fn receiver(&self) -> AccountAddress {
+        self.receiver
+    }
+
+    /// Get the amount sent or received
+    pub fn amount(&self) -> u64 {
+        self.amount
+    }
+
+    /// Get the metadata associated with this event
+    pub fn metadata(&self) -> &Vec<u8> {
+        &self.metadata
+    }
+}
+
+/// Struct that represents a ReceivedPaymentEvent.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReceivedPaymentEvent {
+    amount: u64,
+    sender: AccountAddress,
+    metadata: Vec<u8>,
+}
+
+impl ReceivedPaymentEvent {
+    // TODO: should only be used for libra client testing and be removed eventually
+    pub fn new(amount: u64, sender: AccountAddress, metadata: Vec<u8>) -> Self {
+        Self {
+            amount,
+            sender,
+            metadata,
+        }
+    }
+
+    pub fn try_from_bytes(bytes: &[u8]) -> Result<Self> {
+        lcs::from_bytes(bytes).map_err(Into::into)
+    }
+
+    /// Get the receiver of this transaction event.
+    pub fn sender(&self) -> AccountAddress {
+        self.sender
     }
 
     /// Get the amount sent or received

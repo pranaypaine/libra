@@ -1,0 +1,21 @@
+// check: Invalid Token
+
+module Token {
+    resource T { b: bool }
+    public new(): Self.T {
+        return T{ b: true };
+    }
+}
+
+//! new-transaction
+
+import {{default}}.Token;
+
+main() {
+    let sender: address;
+    let struct1: &mut Token.T;
+
+    sender = get_txn_sender();
+    struct1 = borrow_global_mut<Token.T>(copy(sender));
+    return;
+}

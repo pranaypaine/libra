@@ -1,0 +1,4 @@
+main() {
+}
+
+// check: INVALID_FALL_THROUGH

@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
+// Increase recursion limit to allow for use of select! macro.
+#![recursion_limit = "1024"]
 
 //! Mempool is used to hold transactions that have been submitted but not yet agreed upon and
 //! executed.
@@ -54,20 +56,24 @@
 //! every Consensus commit request. We use a separate system TTL to ensure that a transaction won't
 //! remain stuck in Mempool forever, even if Consensus doesn't make progress
 
-pub mod proto;
-pub use runtime::MempoolRuntime;
+#[macro_use]
+extern crate prometheus;
+
+/// This module provides mocks of shared mempool for tests.
+#[cfg(feature = "fuzzing")]
+pub mod mocks;
+pub use shared_mempool::{
+    bootstrap, CommitNotification, CommitResponse, CommittedTransaction, ConsensusRequest,
+    ConsensusResponse, MempoolClientSender, SubmissionStatus, TransactionExclusion,
+    MEMPOOL_SUBSCRIBED_CONFIGS,
+};
 
 mod core_mempool;
-mod mempool_service;
-mod runtime;
+mod counters;
+pub mod network;
 mod shared_mempool;
 
 // module op counters
-use lazy_static::lazy_static;
 use libra_metrics::OpMetrics;
-lazy_static! {
-    static ref OP_COUNTERS: OpMetrics = OpMetrics::new_and_registered("mempool");
-}
-
-#[cfg(test)]
-mod unit_tests;
+use once_cell::sync::Lazy;
+static OP_COUNTERS: Lazy<OpMetrics> = Lazy::new(|| OpMetrics::new_and_registered("mempool"));

@@ -1,56 +1,50 @@
 error: 
 
-   ┌── tests/move_check/naming/generics_shadowing_invalid.move:8:16 ───
+   ┌── tests/move_check/naming/generics_shadowing_invalid.move:7:14 ───
    │
- 9 │         (s1: Self.S);
-   │              ^^^^^^ Invalid type annotation
+ 7 │         (s1: Self::S);
+   │              ^^^^^^^ Invalid type annotation
    ·
- 8 │     foo<S>(s1: S, s2: S): S {
-   │                - The type: 'S'
+ 6 │     fun foo<S>(s1: S, s2: S): S {
+   │                    - The type: 'S'
    ·
- 9 │         (s1: Self.S);
-   │              ------ Is not compatible with: '0x1.M.S'
+ 7 │         (s1: Self::S);
+   │              ------- Is not compatible with: '0x1::M::S'
    │
 
 error: 
 
-    ┌── tests/move_check/naming/generics_shadowing_invalid.move:10:16 ───
+   ┌── tests/move_check/naming/generics_shadowing_invalid.move:8:20 ───
+   │
+ 8 │         let s: S = S {};
+   │                    ^ Invalid construction. Expected a struct name
+   ·
+ 6 │     fun foo<S>(s1: S, s2: S): S {
+   │             - But 'S' was declared as a type parameter here
+   │
+
+error: 
+
+    ┌── tests/move_check/naming/generics_shadowing_invalid.move:9:9 ───
     │
- 10 │         let s: S = S {};
-    │                ^ Invalid type annotation
+  9 │         bar(s1);
+    │         ^^^^^^^ Invalid call of '0x1::M::bar'. Invalid argument for parameter 's'
     ·
- 10 │         let s: S = S {};
-    │                    ---- The type: '0x1.M.S'
+  6 │     fun foo<S>(s1: S, s2: S): S {
+    │                    - The type: 'S'
     ·
- 10 │         let s: S = S {};
-    │                - Is not compatible with: 'S'
+ 13 │     fun bar(s: S) {}
+    │                - Is not compatible with: '0x1::M::S'
     │
 
 error: 
 
-    ┌── tests/move_check/naming/generics_shadowing_invalid.move:8:16 ───
+    ┌── tests/move_check/naming/generics_shadowing_invalid.move:10:9 ───
     │
- 11 │         bar(s1);
-    │         ^^^^^^^ Invalid call of '0x1.M.bar'. Invalid argument for parameter 's'
+ 10 │         S {}
+    │         ^ Invalid construction. Expected a struct name
     ·
- 8 │     foo<S>(s1: S, s2: S): S {
-    │                - The type: 'S'
-    ·
- 15 │     bar(s: S) {}
-    │            - Is not compatible with: '0x1.M.S'
-    │
-
-error: 
-
-    ┌── tests/move_check/naming/generics_shadowing_invalid.move:8:27 ───
-    │
- 12 │         S {}
-    │         ^^^^ Invalid return expression
-    ·
- 12 │         S {}
-    │         ---- The type: '0x1.M.S'
-    ·
- 8 │     foo<S>(s1: S, s2: S): S {
-    │                           - Is not compatible with: 'S'
+  6 │     fun foo<S>(s1: S, s2: S): S {
+    │             - But 'S' was declared as a type parameter here
     │
 

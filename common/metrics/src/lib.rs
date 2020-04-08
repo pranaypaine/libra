@@ -13,9 +13,6 @@ mod json_metrics;
 pub mod metric_server;
 mod public_metrics;
 
-mod service_metrics;
-pub use service_metrics::ServiceMetrics;
-
 mod op_counters;
 pub use op_counters::{DurationHistogram, OpMetrics};
 
@@ -25,7 +22,7 @@ mod unit_tests;
 // Re-export counter types from prometheus crate
 pub use prometheus::{Histogram, IntCounter, IntCounterVec, IntGauge, IntGaugeVec};
 
-use failure::Result;
+use anyhow::Result;
 use libra_logger::prelude::*;
 use prometheus::{
     core::{Collector, Metric},

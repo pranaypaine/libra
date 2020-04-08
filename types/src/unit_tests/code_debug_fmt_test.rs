@@ -1,8 +1,6 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 use crate::transaction::Script;
 use std::fmt;
 
@@ -12,7 +10,7 @@ fn test_code_fmt() {
     code: "6d6f7665",
     args: [],
 }"#;
-    let script = Script::new(b"move".to_vec(), vec![]);
+    let script = Script::new(b"move".to_vec(), vec![], vec![]);
     let mut output = String::new();
     fmt::write(&mut output, format_args!("{:#?}", script))
         .expect("Error occurred while trying to format Script.");

@@ -80,7 +80,7 @@ pub mod restore;
 mod test_helper;
 mod tree_cache;
 
-use failure::prelude::*;
+use anyhow::{bail, ensure, format_err, Result};
 use libra_crypto::{hash::CryptoHash, HashValue};
 use libra_types::{
     account_state_blob::AccountStateBlob,
@@ -95,7 +95,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tree_cache::TreeCache;
 
 /// The hardcoded maximum height of a [`JellyfishMerkleTree`] in nibbles.
-const ROOT_NIBBLE_HEIGHT: usize = HashValue::LENGTH * 2;
+pub const ROOT_NIBBLE_HEIGHT: usize = HashValue::LENGTH * 2;
 
 /// `TreeReader` defines the interface between
 /// [`JellyfishMerkleTree`](struct.JellyfishMerkleTree.html)
@@ -227,7 +227,7 @@ where
         blob_sets: Vec<Vec<(HashValue, AccountStateBlob)>>,
         first_version: Version,
     ) -> Result<(Vec<HashValue>, TreeUpdateBatch)> {
-        let mut tree_cache = TreeCache::new(self.reader, first_version);
+        let mut tree_cache = TreeCache::new(self.reader, first_version)?;
         for (idx, blob_set) in blob_sets.into_iter().enumerate() {
             assert!(
                 !blob_set.is_empty(),
@@ -597,10 +597,17 @@ where
         Ok(self.get_with_proof(key, version)?.0)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn get_root_hash(&self, version: Version) -> Result<HashValue> {
+        self.get_root_hash_option(version)?
+            .ok_or_else(|| format_err!("Root node not found for version {}.", version))
+    }
+
+    pub fn get_root_hash_option(&self, version: Version) -> Result<Option<HashValue>> {
         let root_node_key = NodeKey::new_empty_path(version);
-        let root_node = self.reader.get_node(&root_node_key)?;
-        Ok(root_node.hash())
+        Ok(self
+            .reader
+            .get_node_option(&root_node_key)?
+            .map(|root_node| root_node.hash()))
     }
 }

@@ -3,50 +3,53 @@
 
 use super::*;
 use crate::{
-    mock_genesis::{db_with_mock_genesis, GENESIS_INFO},
-    test_helper::arb_blocks_to_commit,
+    schema::jellyfish_merkle_node::JellyfishMerkleNodeSchema,
+    test_helper::{arb_blocks_to_commit, arb_mock_genesis},
 };
+use jellyfish_merkle::node_type::{Node, NodeKey};
 use libra_crypto::hash::CryptoHash;
-use libra_tools::tempdir::TempPath;
+use libra_temppath::TempPath;
 use libra_types::{
-    account_config::get_account_resource_or_default, contract_event::ContractEvent,
-    ledger_info::LedgerInfo,
+    account_config::AccountResource, contract_event::ContractEvent,
+    discovery_set::DISCOVERY_SET_CHANGE_EVENT_PATH, ledger_info::LedgerInfo,
+    proof::SparseMerkleLeafNode, vm_error::StatusCode,
 };
 use proptest::prelude::*;
-use rusty_fork::{rusty_fork_id, rusty_fork_test, rusty_fork_test_name};
-use std::collections::HashMap;
+use std::{collections::HashMap, convert::TryFrom};
 
-fn verify_epochs(db: &LibraDB, ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) -> Result<()> {
-    let epoch_change_lis: Vec<_> = ledger_infos_with_sigs
+fn verify_epochs(db: &LibraDB, ledger_infos_with_sigs: &[LedgerInfoWithSignatures]) {
+    let (_, latest_li, actual_epoch_change_lis, _) =
+        db.update_to_latest_ledger(0, Vec::new()).unwrap();
+    let expected_epoch_change_lis: Vec<_> = ledger_infos_with_sigs
         .iter()
-        .filter(|info| info.ledger_info().next_validator_set().is_some())
+        .filter(|info| {
+            info.ledger_info().next_validator_set().is_some()
+                && info.ledger_info().epoch() < latest_li.ledger_info().epoch()
+        })
         .cloned()
         .collect();
-
-    let (_, _, proof, _) = db.update_to_latest_ledger(0, Vec::new())?;
-
-    assert_eq!(epoch_change_lis, proof.ledger_info_with_sigs);
-
-    Ok(())
+    assert_eq!(
+        actual_epoch_change_lis.ledger_info_with_sigs,
+        expected_epoch_change_lis,
+    );
 }
 
-fn test_save_blocks_impl(
-    input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>,
-) -> Result<()> {
+fn test_save_blocks_impl(input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>) {
     let tmp_dir = TempPath::new();
-    let db = db_with_mock_genesis(&tmp_dir)?;
+    let db = LibraDB::new(&tmp_dir);
 
     let num_batches = input.len();
     let mut cur_ver = 0;
     for (batch_idx, (txns_to_commit, ledger_info_with_sigs)) in input.iter().enumerate() {
         db.save_transactions(
             &txns_to_commit,
-            cur_ver + 1, /* first_version */
-            &Some(ledger_info_with_sigs.clone()),
-        )?;
+            cur_ver, /* first_version */
+            Some(ledger_info_with_sigs),
+        )
+        .unwrap();
 
         assert_eq!(
-            db.ledger_store.get_latest_ledger_info()?,
+            db.ledger_store.get_latest_ledger_info().unwrap(),
             *ledger_info_with_sigs
         );
         verify_committed_transactions(
@@ -55,7 +58,7 @@ fn test_save_blocks_impl(
             cur_ver,
             ledger_info_with_sigs,
             batch_idx + 1 == num_batches, /* is_latest */
-        )?;
+        );
 
         cur_ver += txns_to_commit.len() as u64;
     }
@@ -70,7 +73,7 @@ fn test_save_blocks_impl(
         0,
         &latest_ledger_info,
         false, /* is_latest */
-    )?;
+    );
     // Verify an old batch with an old LedgerInfo.
     verify_committed_transactions(
         &db,
@@ -78,18 +81,14 @@ fn test_save_blocks_impl(
         0,
         &first_batch_ledger_info,
         true, /* is_latest */
-    )?;
+    );
     let (_, ledger_infos_with_sigs): (Vec<_>, Vec<_>) = input.iter().cloned().unzip();
-    verify_epochs(&db, &ledger_infos_with_sigs)?;
-
-    Ok(())
+    verify_epochs(&db, &ledger_infos_with_sigs);
 }
 
-fn test_sync_transactions_impl(
-    input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>,
-) -> Result<()> {
+fn test_sync_transactions_impl(input: Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>) {
     let tmp_dir = TempPath::new();
-    let db = db_with_mock_genesis(&tmp_dir)?;
+    let db = LibraDB::new(&tmp_dir);
 
     let num_batches = input.len();
     let mut cur_ver = 0;
@@ -99,15 +98,17 @@ fn test_sync_transactions_impl(
         if batch1_len > 0 {
             db.save_transactions(
                 &txns_to_commit[0..batch1_len],
-                cur_ver + 1, /* first_version */
-                &None,
-            )?;
+                cur_ver, /* first_version */
+                None,
+            )
+            .unwrap();
         }
         db.save_transactions(
             &txns_to_commit[batch1_len..],
-            cur_ver + batch1_len as u64 + 1, /* first_version */
-            &Some(ledger_info_with_sigs.clone()),
-        )?;
+            cur_ver + batch1_len as u64, /* first_version */
+            Some(&ledger_info_with_sigs),
+        )
+        .unwrap();
 
         verify_committed_transactions(
             &db,
@@ -115,11 +116,9 @@ fn test_sync_transactions_impl(
             cur_ver,
             &ledger_info_with_sigs,
             batch_idx + 1 == num_batches, /* is_latest */
-        )?;
+        );
         cur_ver += txns_to_commit.len() as u64;
     }
-
-    Ok(())
 }
 
 fn get_events_by_query_path(
@@ -152,10 +151,9 @@ fn get_events_by_query_path(
             ledger_info.version(),
         )?;
 
-        let account_resource = get_account_resource_or_default(&proof_of_latest_event.blob)?;
-        let expected_event_key = account_resource
-            .get_event_handle_by_query_path(&query_path.path)?
-            .key();
+        let (expected_event_key_opt, _count) = proof_of_latest_event
+            .get_event_key_and_count_by_query_path(&query_path.path)
+            .unwrap();
 
         let num_events = events_with_proof.len() as u64;
         proof_of_latest_event.verify(ledger_info, ledger_info.version(), query_path.address)?;
@@ -173,7 +171,8 @@ fn get_events_by_query_path(
             .map(|(e, seq_num)| {
                 e.verify(
                     ledger_info,
-                    &expected_event_key,
+                    &expected_event_key_opt
+                        .expect("Event stream is nonempty, but event key doesn't exist"),
                     seq_num,
                     e.transaction_version,
                     e.event_index,
@@ -229,7 +228,7 @@ fn verify_events_by_query_path(
     events: Vec<(AccessPath, Vec<ContractEvent>)>,
     ledger_info: &LedgerInfo,
     is_latest: bool,
-) -> Result<()> {
+) {
     events
         .into_iter()
         .map(|(access_path, events)| {
@@ -247,7 +246,8 @@ fn verify_events_by_query_path(
                 last_seq,
                 /* ascending = */ true,
                 is_latest,
-            )?;
+            )
+            .unwrap();
             assert_eq!(events, traversed);
 
             let rev_traversed = get_events_by_query_path(
@@ -258,13 +258,13 @@ fn verify_events_by_query_path(
                 last_seq,
                 /* ascending = */ false,
                 is_latest,
-            )?;
+            )
+            .unwrap();
             assert_eq!(events, rev_traversed);
             Ok(())
         })
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(())
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
 }
 
 fn group_events_by_query_path(
@@ -273,11 +273,7 @@ fn group_events_by_query_path(
     let mut event_key_to_query_path = HashMap::new();
     for txn in txns_to_commit {
         for (address, account_blob) in txn.account_states().iter() {
-            let account_btree = account_blob
-                .try_into()
-                .expect("The stored account blob can't be parsed as BTreeMap");
-            let account =
-                AccountResource::make_from(&account_btree).expect("AccountResource is not found");
+            let account = AccountResource::try_from(account_blob).unwrap();
             event_key_to_query_path.insert(
                 account.sent_events().key().clone(),
                 AccessPath::new_for_sent_event(*address),
@@ -310,15 +306,13 @@ fn verify_committed_transactions(
     first_version: Version,
     ledger_info_with_sigs: &LedgerInfoWithSignatures,
     is_latest: bool,
-) -> Result<()> {
+) {
     let ledger_info = ledger_info_with_sigs.ledger_info();
     let ledger_version = ledger_info.version();
 
     let mut cur_ver = first_version;
     for txn_to_commit in txns_to_commit {
-        cur_ver += 1;
-
-        let txn_info = db.ledger_store.get_transaction_info(cur_ver)?;
+        let txn_info = db.ledger_store.get_transaction_info(cur_ver).unwrap();
 
         // Verify transaction hash.
         assert_eq!(
@@ -327,36 +321,41 @@ fn verify_committed_transactions(
         );
 
         // Fetch and verify transaction itself.
-        let txn = txn_to_commit.transaction().as_signed_user_txn()?;
-        let txn_with_proof = db.get_transaction_with_proof(cur_ver, ledger_version, true)?;
-        txn_with_proof.verify_user_txn(
-            ledger_info,
-            cur_ver,
-            txn.sender(),
-            txn.sequence_number(),
-        )?;
+        let txn = txn_to_commit.transaction().as_signed_user_txn().unwrap();
+        let txn_with_proof = db
+            .get_transaction_with_proof(cur_ver, ledger_version, true)
+            .unwrap();
+        txn_with_proof
+            .verify_user_txn(ledger_info, cur_ver, txn.sender(), txn.sequence_number())
+            .unwrap();
 
         let txn_with_proof = db
-            .get_txn_by_account(txn.sender(), txn.sequence_number(), ledger_version, true)?
+            .get_txn_by_account(txn.sender(), txn.sequence_number(), ledger_version, true)
+            .unwrap()
             .expect("Should exist.");
-        txn_with_proof.verify_user_txn(
-            ledger_info,
-            cur_ver,
-            txn.sender(),
-            txn.sequence_number(),
-        )?;
+        txn_with_proof
+            .verify_user_txn(ledger_info, cur_ver, txn.sender(), txn.sequence_number())
+            .unwrap();
 
-        let txn_list_with_proof =
-            db.get_transactions(cur_ver, 1, ledger_version, true /* fetch_events */)?;
-        txn_list_with_proof.verify(ledger_info, Some(cur_ver))?;
+        let txn_list_with_proof = db
+            .get_transactions(cur_ver, 1, ledger_version, true /* fetch_events */)
+            .unwrap();
+        txn_list_with_proof
+            .verify(ledger_info, Some(cur_ver))
+            .unwrap();
 
         // Fetch and verify account states.
         for (addr, expected_blob) in txn_to_commit.account_states() {
-            let account_state_with_proof =
-                db.get_account_state_with_proof(*addr, cur_ver, ledger_version)?;
+            let account_state_with_proof = db
+                .get_account_state_with_proof(*addr, cur_ver, ledger_version)
+                .unwrap();
             assert_eq!(account_state_with_proof.blob, Some(expected_blob.clone()));
-            account_state_with_proof.verify(ledger_info, cur_ver, *addr)?;
+            account_state_with_proof
+                .verify(ledger_info, cur_ver, *addr)
+                .unwrap();
         }
+
+        cur_ver += 1;
     }
 
     // Fetch and verify events.
@@ -366,9 +365,7 @@ fn verify_committed_transactions(
         group_events_by_query_path(txns_to_commit),
         ledger_info,
         is_latest,
-    )?;
-
-    Ok(())
+    );
 }
 
 proptest! {
@@ -376,74 +373,13 @@ proptest! {
 
     #[test]
     fn test_save_blocks(input in arb_blocks_to_commit()) {
-        test_save_blocks_impl(input).unwrap();
+        test_save_blocks_impl(input);
     }
 
     #[test]
     fn test_sync_transactions(input in arb_blocks_to_commit()) {
-        test_sync_transactions_impl(input).unwrap();
+        test_sync_transactions_impl(input);
     }
-}
-
-#[test]
-fn test_bootstrap() {
-    let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
-
-    let genesis_txn_info = GENESIS_INFO.0.clone();
-    let genesis_ledger_info_with_sigs = GENESIS_INFO.1.clone();
-    let genesis_txn = GENESIS_INFO.2.clone();
-
-    db.save_transactions(
-        &[genesis_txn],
-        0, /* first_version */
-        &Some(genesis_ledger_info_with_sigs.clone()),
-    )
-    .unwrap();
-
-    assert_eq!(db.get_latest_version().unwrap(), 0);
-    assert_eq!(
-        db.ledger_store.get_latest_ledger_info().unwrap(),
-        genesis_ledger_info_with_sigs
-    );
-    assert_eq!(
-        db.ledger_store.get_transaction_info(0).unwrap(),
-        genesis_txn_info
-    );
-}
-
-rusty_fork_test! {
-#[test]
-fn test_committed_txns_counter() {
-    let tmp_dir = TempPath::new();
-    let db = LibraDB::new(&tmp_dir);
-
-    let genesis_ledger_info_with_sigs = GENESIS_INFO.1.clone();
-    let genesis_txn = GENESIS_INFO.2.clone();
-
-    db.save_transactions(&[genesis_txn],
-                         0 /* first_version */,
-                         &Some(genesis_ledger_info_with_sigs.clone()))
-        .unwrap();
-    assert_eq!(OP_COUNTER.counter("committed_txns").get(), 1);
-}
-}
-
-#[test]
-fn test_bootstrapping_already_bootstrapped_db() {
-    let tmp_dir = TempPath::new();
-    let db = db_with_mock_genesis(&tmp_dir).unwrap();
-    let ledger_info = db.ledger_store.get_latest_ledger_info().unwrap();
-
-    let genesis_ledger_info_with_sigs = GENESIS_INFO.1.clone();
-    let genesis_txn = GENESIS_INFO.2.clone();
-    assert!(db
-        .save_transactions(&[genesis_txn], 0, &Some(genesis_ledger_info_with_sigs))
-        .is_ok());
-    assert_eq!(
-        ledger_info,
-        db.ledger_store.get_latest_ledger_info().unwrap()
-    );
 }
 
 #[test]
@@ -489,4 +425,121 @@ fn test_too_many_requested() {
             0
         )
         .is_err());
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(1))]
+
+    #[test]
+    fn test_get_events_from_non_existent_account(
+        (genesis_txn_to_commit, ledger_info_with_sigs) in arb_mock_genesis(),
+        non_existent_address in any::<AccountAddress>(),
+    ) {
+        let tmp_dir = TempPath::new();
+        let db = LibraDB::new(&tmp_dir);
+
+        db.save_transactions(&[genesis_txn_to_commit], 0, Some(&ledger_info_with_sigs)).unwrap();
+        prop_assume!(
+            db.get_account_state_with_proof(non_existent_address, 0, 0).unwrap().blob.is_none()
+        );
+
+        let (events, account_state_with_proof) = db
+            .get_events_by_query_path(
+                &AccessPath::new_for_sent_event(non_existent_address),
+                0,
+                true,
+                100,
+                0,
+            )
+            .unwrap();
+
+        account_state_with_proof
+            .verify(ledger_info_with_sigs.ledger_info(), 0, non_existent_address)
+            .unwrap();
+        assert!(account_state_with_proof.blob.is_none());
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn test_get_from_non_existent_event_stream(
+        (genesis_txn_to_commit, ledger_info_with_sigs) in arb_mock_genesis(),
+    ) {
+        let tmp_dir = TempPath::new();
+        let db = LibraDB::new(&tmp_dir);
+
+        let account = genesis_txn_to_commit
+            .transaction()
+            .as_signed_user_txn()
+            .unwrap()
+            .sender();
+
+        db.save_transactions(&[genesis_txn_to_commit], 0, Some(&ledger_info_with_sigs)).unwrap();
+
+        // The mock genesis txn is really just an ordinary user account, there is no
+        // DiscoverySetResource under it.
+        let (events, account_state_with_proof) = db
+            .get_events_by_query_path(
+                &AccessPath::new(account, DISCOVERY_SET_CHANGE_EVENT_PATH.to_vec()),
+                0,
+                true,
+                100,
+                0,
+            )
+            .unwrap();
+
+        account_state_with_proof
+            .verify(ledger_info_with_sigs.ledger_info(), 0, account)
+            .unwrap();
+        assert!(account_state_with_proof.blob.is_some());
+        assert!(events.is_empty());
+    }
+}
+
+#[test]
+fn test_get_latest_tree_state() {
+    let tmp_dir = TempPath::new();
+    let db = LibraDB::new(&tmp_dir);
+
+    // entirely emtpy db
+    let empty = db.get_latest_tree_state().unwrap();
+    assert_eq!(
+        empty,
+        TreeState::new(0, vec![], *SPARSE_MERKLE_PLACEHOLDER_HASH,)
+    );
+
+    // unbootstrapped db with pre-genesis state
+    let address = AccountAddress::default();
+    let blob = AccountStateBlob::from(vec![1]);
+    db.db
+        .put::<JellyfishMerkleNodeSchema>(
+            &NodeKey::new_empty_path(PRE_GENESIS_VERSION),
+            &Node::new_leaf(address.hash(), blob.clone()),
+        )
+        .unwrap();
+    let hash = SparseMerkleLeafNode::new(address.hash(), blob.hash()).hash();
+    let pre_genesis = db.get_latest_tree_state().unwrap();
+    assert_eq!(pre_genesis, TreeState::new(0, vec![], hash));
+
+    // bootstrapped db (any transaction info is in)
+    let txn_info = TransactionInfo::new(
+        HashValue::random(),
+        HashValue::random(),
+        HashValue::random(),
+        0,
+        StatusCode::UNKNOWN_STATUS,
+    );
+    put_transaction_info(&db, 0, &txn_info);
+    let bootstrapped = db.get_latest_tree_state().unwrap();
+    assert_eq!(
+        bootstrapped,
+        TreeState::new(1, vec![txn_info.hash()], txn_info.state_root_hash())
+    );
+}
+
+fn put_transaction_info(db: &LibraDB, version: Version, txn_info: &TransactionInfo) {
+    let mut cs = ChangeSet::new();
+    db.ledger_store
+        .put_transaction_infos(version, &[txn_info.clone()], &mut cs)
+        .unwrap();
+    db.db.write_schemas(cs.batch).unwrap();
 }

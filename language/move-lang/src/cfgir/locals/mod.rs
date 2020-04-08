@@ -1,17 +1,21 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-mod state;
+pub mod state;
 
-use super::{absint::*, ast::*};
-use crate::shared::unique_map::UniqueMap;
+use super::absint::*;
 use crate::{
     errors::*,
-    hlir::translate::{display_var, DisplayVar},
-    parser::ast::{Kind_, Var},
-    shared::*,
+    hlir::{
+        ast::*,
+        translate::{display_var, DisplayVar},
+    },
+    parser::ast::{Kind_, StructName, Var},
+    shared::{unique_map::UniqueMap, *},
 };
+use move_ir_types::location::*;
 use state::*;
+use std::collections::{BTreeMap, BTreeSet};
 
 //**************************************************************************************************
 // Entry and trait bindings
@@ -19,26 +23,33 @@ use state::*;
 
 struct LocalsSafety<'a> {
     local_types: &'a UniqueMap<Var, SingleType>,
+    signature: &'a FunctionSignature,
 }
 
 impl<'a> LocalsSafety<'a> {
-    fn new(local_types: &'a UniqueMap<Var, SingleType>) -> Self {
-        Self { local_types }
+    fn new(local_types: &'a UniqueMap<Var, SingleType>, signature: &'a FunctionSignature) -> Self {
+        Self {
+            local_types,
+            signature,
+        }
     }
 }
 
 struct Context<'a, 'b> {
     local_types: &'a UniqueMap<Var, SingleType>,
     local_states: &'b mut LocalStates,
+    signature: &'a FunctionSignature,
     errors: Errors,
 }
 
 impl<'a, 'b> Context<'a, 'b> {
     fn new(locals_safety: &'a LocalsSafety, local_states: &'b mut LocalStates) -> Self {
         let local_types = &locals_safety.local_types;
+        let signature = &locals_safety.signature;
         Self {
             local_types,
             local_states,
+            signature,
             errors: vec![],
         }
     }
@@ -68,7 +79,13 @@ impl<'a, 'b> Context<'a, 'b> {
 impl<'a> TransferFunctions for LocalsSafety<'a> {
     type State = LocalStates;
 
-    fn execute(&mut self, pre: &mut Self::State, cmd: &Command) -> Errors {
+    fn execute(
+        &mut self,
+        pre: &mut Self::State,
+        _lbl: Label,
+        _idx: usize,
+        cmd: &Command,
+    ) -> Errors {
         let mut context = Context::new(self, pre);
         command(&mut context, cmd);
         context.get_errors()
@@ -80,12 +97,15 @@ impl<'a> AbstractInterpreter for LocalsSafety<'a> {}
 pub fn verify(
     errors: &mut Errors,
     signature: &FunctionSignature,
+    _acquires: &BTreeSet<StructName>,
     locals: &UniqueMap<Var, SingleType>,
     cfg: &super::cfg::BlockCFG,
-) {
+) -> BTreeMap<Label, LocalStates> {
     let initial_state = LocalStates::initial(&signature.parameters, locals);
-    let mut locals_safety = LocalsSafety::new(locals);
-    errors.append(&mut locals_safety.analyze_function(cfg, initial_state));
+    let mut locals_safety = LocalsSafety::new(locals, signature);
+    let (final_state, mut es) = locals_safety.analyze_function(cfg, initial_state);
+    errors.append(&mut es);
+    final_state
 }
 
 //**************************************************************************************************
@@ -115,29 +135,33 @@ fn command(context: &mut Context, sp!(loc, cmd_): &Command) {
                     | LocalState::MaybeUnavailable { available, .. } => {
                         let ty = context.local_type(&local);
                         let kind = ty.value.kind(ty.loc);
-                        match &kind.value {
-                            Kind_::Unrestricted | Kind_::Affine => (),
-                            Kind_::Resource | Kind_::Unknown => {
-                                let verb = match (state, &kind.value) {
-                                    (LocalState::Unavailable(_), _) => unreachable!(),
-                                    (LocalState::Available(_), Kind_::Resource) => "contains",
-                                    _ => "might contain",
-                                };
-                                let available = *available;
-                                let stmt = match display_var(local.value()) {
-                                    DisplayVar::Tmp => {
-                                        "The resource is created but not used".to_owned()
+                        if kind.value.is_resourceful() {
+                            let verb = match (state, &kind.value) {
+                                (LocalState::Unavailable(_), _) => unreachable!(),
+                                (LocalState::Available(_), Kind_::Resource) => "still contains",
+                                _ => "might still contain",
+                            };
+                            let available = *available;
+                            let stmt = match display_var(local.value()) {
+                                DisplayVar::Tmp => {
+                                    "The resource is created but not used".to_owned()
+                                }
+                                DisplayVar::Orig(l) => {
+                                    if context.signature.is_parameter(&local) {
+                                        format!("The parameter '{}' {} a resource value", l, verb)
+                                    } else {
+                                        format!(
+                                            "The local '{}' {} a resource value due to this assignment",
+                                            l, verb
+                                        )
                                     }
-                                    DisplayVar::Orig(l) => format!(
-                                    "The local {} still {} a resource value due to this assignment",
-                                    l, verb
-                                ),
-                                };
-                                errors.push(vec![
-                                (*loc, "Invalid return".into()),
-                                (available, format!("{}. The resource must be consumed before the function returns", stmt))
-                            ])
-                            }
+                                }
+                            };
+                            let msg = format!(
+                                "{}. The resource must be consumed before the function returns",
+                                stmt
+                            );
+                            errors.push(vec![(*loc, "Invalid return".into()), (available, msg)])
                         }
                     }
                 }
@@ -145,6 +169,7 @@ fn command(context: &mut Context, sp!(loc, cmd_): &Command) {
             errors.into_iter().for_each(|error| context.error(error))
         }
         C::Jump(_) => (),
+        C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
     }
 }
 
@@ -159,25 +184,30 @@ fn lvalue(context: &mut Context, sp!(loc, l_): &LValue) {
         L::Var(v, _) => {
             let ty = context.local_type(v);
             let kind = ty.value.kind(ty.loc);
-            if let Kind_::Resource = &kind.value {
+            if kind.value.is_resourceful() {
                 let old_state = context.get_state(v);
                 match old_state {
                     LocalState::Unavailable(_) => (),
                     LocalState::Available(available)
                     | LocalState::MaybeUnavailable { available, .. } => {
-                        let verb = match old_state {
-                            LocalState::Unavailable(_) => unreachable!(),
-                            LocalState::Available(_) => "contains",
-                            LocalState::MaybeUnavailable { .. } => "might contain",
+                        let verb = match (old_state, &kind.value) {
+                            (LocalState::Unavailable(_), _) => unreachable!(),
+                            (LocalState::Available(_), Kind_::Resource) => "contains",
+                            _ => "might contain",
                         };
                         let available = *available;
                         let vstr = match display_var(v.value()) {
                             DisplayVar::Tmp => panic!("ICE invalid assign tmp local"),
                             DisplayVar::Orig(s) => s,
                         };
+                        let msg = format!(
+                            "The local {} a resource value due to this assignment. The \
+                             resource must be used before you assign to this local again",
+                            verb
+                        );
                         context.error(vec![
                             (*loc, format!("Invalid assignment to local '{}'", vstr)),
-                            (available, format!("The local {} a resource value due to this assignment. The resource must be used before you assign this to this local again", verb))
+                            (available, msg),
                         ])
                     }
                 }
@@ -192,7 +222,7 @@ fn exp(context: &mut Context, parent_e: &Exp) {
     use UnannotatedExp_ as E;
     let eloc = &parent_e.exp.loc;
     match &parent_e.exp.value {
-        E::Unit | E::Value(_) | E::UnresolvedError => (),
+        E::Unit | E::Value(_) | E::Spec(_, _) | E::UnresolvedError => (),
 
         E::BorrowLocal(_, var) | E::Copy { var, .. } => use_local(context, eloc, var),
 
@@ -206,7 +236,8 @@ fn exp(context: &mut Context, parent_e: &Exp) {
         | E::Freeze(e)
         | E::Dereference(e)
         | E::UnaryExp(_, e)
-        | E::Borrow(_, e, _) => exp(context, e),
+        | E::Borrow(_, e, _)
+        | E::Cast(e, _) => exp(context, e),
 
         E::BinopExp(e1, _, e2) => {
             exp(context, e1);
@@ -216,6 +247,8 @@ fn exp(context: &mut Context, parent_e: &Exp) {
         E::Pack(_, _, fields) => fields.iter().for_each(|(_, _, e)| exp(context, e)),
 
         E::ExpList(es) => es.iter().for_each(|item| exp_list_item(context, item)),
+
+        E::Unreachable => panic!("ICE should not analyze dead code"),
     }
 }
 
@@ -233,18 +266,23 @@ fn use_local(context: &mut Context, loc: &Loc, local: &Var) {
         L::Unavailable(unavailable) | L::MaybeUnavailable { unavailable, .. } => {
             let verb = match state {
                 LocalState::Available(_) => unreachable!(),
-                LocalState::Unavailable(_) => "has been moved",
-                LocalState::MaybeUnavailable { .. } => "might have been moved",
+                LocalState::Unavailable(_) => "does",
+                LocalState::MaybeUnavailable { .. } => "might",
             };
             let unavailable = *unavailable;
             let vstr = match display_var(local.value()) {
-                DisplayVar::Tmp => panic!("ICE invalid use tmp local"),
+                DisplayVar::Tmp => panic!("ICE invalid use tmp local {}", local.value()),
                 DisplayVar::Orig(s) => s,
             };
+            let msg = format!(
+                "The local {} not have a value due to this position. The local must be assigned \
+                 a value before being used",
+                verb
+            );
             context.error(vec![
-                    (*loc, format!("Invalid usage of local '{}'", vstr)),
-                    (unavailable, format!("The value {} out of the local. The local must be assigned a new value before being used", verb))
-                ])
+                (*loc, format!("Invalid usage of local '{}'", vstr)),
+                (unavailable, msg),
+            ])
         }
     }
 }

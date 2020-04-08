@@ -1,8 +1,6 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 //! Suppose we have the following data structure in a smart contract:
 //!
 //! struct B {
@@ -39,19 +37,13 @@
 
 use crate::{
     account_address::AccountAddress,
-    account_config::{
-        account_resource_path, association_address, ACCOUNT_RECEIVED_EVENT_PATH,
-        ACCOUNT_SENT_EVENT_PATH,
-    },
-    identifier::{IdentStr, Identifier},
+    account_config::{ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_RESOURCE_PATH, ACCOUNT_SENT_EVENT_PATH},
     language_storage::{ModuleId, ResourceKey, StructTag},
-    validator_set::validator_set_path,
 };
-use failure::prelude::*;
-use hex;
-use lazy_static::lazy_static;
+use anyhow::{Error, Result};
 use libra_crypto::hash::{CryptoHash, HashValue};
 use mirai_annotations::*;
+use move_core_types::identifier::{IdentStr, Identifier};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use radix_trie::TrieKey;
@@ -199,12 +191,6 @@ impl TrieKey for Accesses {
     }
 }
 
-lazy_static! {
-    /// The access path where the Validator Set resource is stored.
-    pub static ref VALIDATOR_SET_ACCESS_PATH: AccessPath =
-        AccessPath::new(association_address(), validator_set_path());
-}
-
 #[derive(Clone, Eq, PartialEq, Default, Hash, Serialize, Deserialize, Ord, PartialOrd)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct AccessPath {
@@ -222,18 +208,7 @@ impl AccessPath {
 
     /// Given an address, returns the corresponding access path that stores the Account resource.
     pub fn new_for_account(address: AccountAddress) -> Self {
-        Self::new(address, account_resource_path())
-    }
-
-    /// Create an AccessPath for a ContractEvent.
-    /// That is an AccessPah that uniquely identifies a given event for a published resource.
-    pub fn new_for_event(address: AccountAddress, root: &[u8], key: &[u8]) -> Self {
-        let mut path: Vec<u8> = Vec::new();
-        path.extend_from_slice(root);
-        path.push(b'/');
-        path.extend_from_slice(key);
-        path.push(b'/');
-        Self::new(address, path)
+        Self::new(address, ACCOUNT_RESOURCE_PATH.to_vec())
     }
 
     /// Create an AccessPath to the event for the sender account in a deposit operation.

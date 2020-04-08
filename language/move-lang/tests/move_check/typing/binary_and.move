@@ -3,7 +3,7 @@ module M {
         f: bool
     }
 
-    t0(x: bool, r: R) {
+    fun t0(x: bool, r: R) {
         true && false;
         false && true;
         true && false;
@@ -11,6 +11,6 @@ module M {
         copy x && move x;
         r.f && r.f;
         true && false && (true && false);
-        let R {f} = r;
+        let R {f: _} = r;
     }
 }

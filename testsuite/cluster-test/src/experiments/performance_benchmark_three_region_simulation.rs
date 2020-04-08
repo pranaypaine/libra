@@ -1,69 +1,116 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::fmt::Display;
-
-use failure::_core::fmt::{Error, Formatter};
-use failure::_core::time::Duration;
-
-use crate::cluster::Cluster;
-use crate::effects::{three_region_simulation_effects, Effect};
-use crate::experiments::Context;
-use crate::experiments::Experiment;
-use crate::stats;
-
-use crate::util::unix_timestamp_now;
-use futures::future::join_all;
-use futures::future::{BoxFuture, FutureExt};
+use crate::{
+    cluster::Cluster,
+    cluster_swarm::{cluster_swarm_kube::ClusterSwarmKube, ClusterSwarm},
+    effects::{three_region_simulation_effects, Effect},
+    experiments::{Context, Experiment, ExperimentParam},
+    instance::Instance,
+    stats,
+    tx_emitter::EmitJobRequest,
+    util::unix_timestamp_now,
+};
+use anyhow::Result;
+use async_trait::async_trait;
+use futures::future::{join_all, try_join_all};
+use libra_logger::*;
+use std::{
+    fmt::{Display, Error, Formatter},
+    time::Duration,
+};
+use structopt::StructOpt;
 
 pub struct PerformanceBenchmarkThreeRegionSimulation {
     cluster: Cluster,
 }
 
-impl PerformanceBenchmarkThreeRegionSimulation {
-    pub fn new(cluster: &Cluster) -> Self {
-        Self {
+#[derive(StructOpt, Debug)]
+pub struct PerformanceBenchmarkThreeRegionSimulationParams {}
+
+impl ExperimentParam for PerformanceBenchmarkThreeRegionSimulationParams {
+    type E = PerformanceBenchmarkThreeRegionSimulation;
+    fn build(self, cluster: &Cluster) -> Self::E {
+        Self::E {
             cluster: cluster.clone(),
         }
     }
 }
 
+#[async_trait]
 impl Experiment for PerformanceBenchmarkThreeRegionSimulation {
-    fn run<'a>(
-        &'a mut self,
-        context: &'a mut Context,
-    ) -> BoxFuture<'a, failure::Result<Option<String>>> {
-        async move {
-            let (us, euro) = self.cluster.split_n_random(80);
-            let (us_west, us_east) = us.split_n_random(40);
-            let network_effects = three_region_simulation_effects(
+    async fn run(&mut self, context: &mut Context<'_>) -> anyhow::Result<()> {
+        let num_nodes = self.cluster.validator_instances().len();
+        let split_country_num = ((num_nodes as f64) * 0.8) as usize;
+        let split_region_num = split_country_num / 2;
+        let (us, euro) = self.cluster.split_n_validators_random(split_country_num);
+        let (us_west, us_east) = us.split_n_validators_random(split_region_num);
+        let network_effects = three_region_simulation_effects(
+            (
+                us_west.validator_instances().to_vec(),
+                us_east.validator_instances().to_vec(),
+                euro.validator_instances().to_vec(),
+            ),
+            (
+                Duration::from_millis(60), // us_east<->eu one way delay
+                Duration::from_millis(95), // us_west<->eu one way delay
+                Duration::from_millis(40), // us_west<->us_east one way delay
+            ),
+        );
+        if let Some(cluster_swarm) = context.cluster_swarm {
+            three_region_simulation_effects_k8s(
                 (
-                    us_west.instances().clone(),
-                    us_east.instances().clone(),
-                    euro.instances().clone(),
+                    us_west.validator_instances().to_vec(),
+                    us_east.validator_instances().to_vec(),
+                    euro.validator_instances().to_vec(),
                 ),
                 (
                     Duration::from_millis(60), // us_east<->eu one way delay
                     Duration::from_millis(95), // us_west<->eu one way delay
                     Duration::from_millis(40), // us_west<->us_east one way delay
                 ),
-            );
+                cluster_swarm,
+            )
+            .await?;
+        } else {
+            info!("cluster_swarm is not set");
             join_all(network_effects.iter().map(|e| e.activate())).await;
-            let window = Duration::from_secs(180);
-            context.tx_emitter.emit_txn_for(
-                window + Duration::from_secs(60),
-                self.cluster.instances().clone(),
-            )?;
-            let end = unix_timestamp_now();
-            let start = end - window;
-            let (avg_tps, avg_latency) = stats::txn_stats(&context.prometheus, start, end)?;
-            join_all(network_effects.iter().map(|e| e.deactivate())).await;
-            Ok(Some(format!(
-                "{} : {:.0} TPS, {:.1} ms latency",
-                self, avg_tps, avg_latency
-            )))
         }
-            .boxed()
+
+        let window = Duration::from_secs(240);
+        let emit_job_request = if context.emit_to_validator {
+            EmitJobRequest::for_instances(
+                context.cluster.validator_instances().to_vec(),
+                context.global_emit_job_request,
+            )
+        } else {
+            EmitJobRequest::for_instances(
+                context.cluster.fullnode_instances().to_vec(),
+                context.global_emit_job_request,
+            )
+        };
+        context
+            .tx_emitter
+            .emit_txn_for(window, emit_job_request)
+            .await?;
+        let buffer = Duration::from_secs(30);
+        let end = unix_timestamp_now() - buffer;
+        let start = end - window + 2 * buffer;
+        let (avg_tps, avg_latency) = stats::txn_stats(&context.prometheus, start, end)?;
+        if let Some(cluster_swarm) = context.cluster_swarm {
+            cluster_swarm.remove_all_network_effects().await?;
+        } else {
+            join_all(network_effects.iter().map(|e| e.deactivate())).await;
+        }
+        context.report.report_metric(&self, "avg_tps", avg_tps);
+        context
+            .report
+            .report_metric(&self, "avg_latency", avg_latency);
+        context.report.report_text(format!(
+            "{} : {:.0} TPS, {:.1} ms latency",
+            self, avg_tps, avg_latency
+        ));
+        Ok(())
     }
 
     fn deadline(&self) -> Duration {
@@ -75,4 +122,91 @@ impl Display for PerformanceBenchmarkThreeRegionSimulation {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
         write!(f, "3 Region Simulation")
     }
+}
+
+async fn add_network_delay_k8s(
+    instance: Instance,
+    configuration: Vec<(Vec<Instance>, Duration)>,
+    cluster_swarm: &ClusterSwarmKube,
+) -> Result<()> {
+    let mut command = "".to_string();
+    command += "tc qdisc delete dev eth0 root; ";
+    // Create a HTB https://linux.die.net/man/8/tc-htb
+    command += "tc qdisc add dev eth0 root handle 1: htb; ";
+    for i in 0..configuration.len() {
+        // Create a class within the HTB https://linux.die.net/man/8/tc
+        command += format!(
+            "tc class add dev eth0 parent 1: classid 1:{} htb rate 1tbit; ",
+            i + 1
+        )
+        .as_str();
+    }
+    for (i, config) in configuration.iter().enumerate() {
+        // Create u32 filters so that all the target instances are classified as class 1:(i+1)
+        // http://man7.org/linux/man-pages/man8/tc-u32.8.html
+        for target_instance in &config.0 {
+            command += format!("tc filter add dev eth0 parent 1: protocol ip prio 1 u32 flowid 1:{} match ip dst {}; ", i+1, target_instance.ip()).as_str();
+        }
+    }
+    for (i, config) in configuration.iter().enumerate() {
+        // Use netem to delay packets to this class
+        command += format!(
+            "tc qdisc add dev eth0 parent 1:{} handle {}0: netem delay {}ms; ",
+            i + 1,
+            i + 1,
+            config.1.as_millis(),
+        )
+        .as_str();
+    }
+
+    cluster_swarm
+        .run(
+            &instance,
+            "853397791086.dkr.ecr.us-west-2.amazonaws.com/cluster-test-util:latest",
+            command,
+            "add-network-delay",
+        )
+        .await
+}
+
+async fn three_region_simulation_effects_k8s(
+    regions: (Vec<Instance>, Vec<Instance>, Vec<Instance>),
+    delays_bw_regions: (Duration, Duration, Duration),
+    cluster_swarm: &ClusterSwarmKube,
+) -> Result<()> {
+    let mut futures = vec![];
+    for instance in &regions.0 {
+        let configuration = vec![
+            (regions.1.clone(), delays_bw_regions.2),
+            (regions.2.clone(), delays_bw_regions.1),
+        ];
+        futures.push(add_network_delay_k8s(
+            instance.clone(),
+            configuration,
+            cluster_swarm,
+        ));
+    }
+    for instance in &regions.1 {
+        let configuration = vec![
+            (regions.0.clone(), delays_bw_regions.2),
+            (regions.2.clone(), delays_bw_regions.0),
+        ];
+        futures.push(add_network_delay_k8s(
+            instance.clone(),
+            configuration,
+            cluster_swarm,
+        ));
+    }
+    for instance in &regions.2 {
+        let configuration = vec![
+            (regions.1.clone(), delays_bw_regions.0),
+            (regions.0.clone(), delays_bw_regions.1),
+        ];
+        futures.push(add_network_delay_k8s(
+            instance.clone(),
+            configuration,
+            cluster_swarm,
+        ));
+    }
+    try_join_all(futures).await.map(|_| ())
 }

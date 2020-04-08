@@ -3,14 +3,14 @@
 
 extern crate test_generation;
 use test_generation::abstract_state::{AbstractState, AbstractValue};
-use vm::file_format::{AddressPoolIndex, Bytecode, SignatureToken, UserStringIndex};
+use vm::file_format::{AddressPoolIndex, Bytecode, SignatureToken};
 
 mod common;
 
 #[test]
-fn bytecode_ldconst() {
+fn bytecode_ldu64() {
     let state1 = AbstractState::new();
-    let state2 = common::run_instruction(Bytecode::LdConst(0), state1);
+    let (state2, _) = common::run_instruction(Bytecode::LdU64(0), state1);
     assert_eq!(
         state2.stack_peek(0),
         Some(AbstractValue::new_primitive(SignatureToken::U64)),
@@ -21,7 +21,7 @@ fn bytecode_ldconst() {
 #[test]
 fn bytecode_ldtrue() {
     let state1 = AbstractState::new();
-    let state2 = common::run_instruction(Bytecode::LdTrue, state1);
+    let (state2, _) = common::run_instruction(Bytecode::LdTrue, state1);
     assert_eq!(
         state2.stack_peek(0),
         Some(AbstractValue::new_primitive(SignatureToken::Bool)),
@@ -32,7 +32,7 @@ fn bytecode_ldtrue() {
 #[test]
 fn bytecode_ldfalse() {
     let state1 = AbstractState::new();
-    let state2 = common::run_instruction(Bytecode::LdFalse, state1);
+    let (state2, _) = common::run_instruction(Bytecode::LdFalse, state1);
     assert_eq!(
         state2.stack_peek(0),
         Some(AbstractValue::new_primitive(SignatureToken::Bool)),
@@ -41,20 +41,9 @@ fn bytecode_ldfalse() {
 }
 
 #[test]
-fn bytecode_ldstr() {
-    let state1 = AbstractState::new();
-    let state2 = common::run_instruction(Bytecode::LdStr(UserStringIndex::new(0)), state1);
-    assert_eq!(
-        state2.stack_peek(0),
-        Some(AbstractValue::new_primitive(SignatureToken::String)),
-        "stack type postcondition not met"
-    );
-}
-
-#[test]
 fn bytecode_ldaddr() {
     let state1 = AbstractState::new();
-    let state2 = common::run_instruction(Bytecode::LdAddr(AddressPoolIndex::new(0)), state1);
+    let (state2, _) = common::run_instruction(Bytecode::LdAddr(AddressPoolIndex::new(0)), state1);
     assert_eq!(
         state2.stack_peek(0),
         Some(AbstractValue::new_primitive(SignatureToken::Address)),

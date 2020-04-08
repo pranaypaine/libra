@@ -10,25 +10,21 @@ use crate::{
     },
     OP_COUNTER,
 };
-use failure::prelude::*;
+use anyhow::Result;
+use jellyfish_merkle::StaleNodeIndex;
 use libra_logger::prelude::*;
 use libra_types::transaction::Version;
 use schemadb::{ReadOptions, SchemaBatch, SchemaIterator, DB};
-use std::{
-    sync::{
-        mpsc::{channel, Receiver, Sender},
-        Arc, Mutex,
-    },
-    thread::JoinHandle,
-};
-
-use failure::_core::sync::atomic::Ordering;
-use jellyfish_merkle::StaleNodeIndex;
 #[cfg(test)]
 use std::thread::sleep;
 use std::{
     iter::Peekable,
-    sync::atomic::AtomicU64,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
+    },
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -104,7 +100,7 @@ impl Pruner {
                 }
                 sleep(Duration::from_millis(1));
             }
-            bail!("Timeout waiting for pruner worker.");
+            anyhow::bail!("Timeout waiting for pruner worker.");
         }
         Ok(())
     }

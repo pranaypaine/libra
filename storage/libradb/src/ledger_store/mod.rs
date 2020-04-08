@@ -4,33 +4,35 @@
 //! This file defines ledger store APIs that are related to the main ledger accumulator, from the
 //! root(LedgerInfo) to leaf(TransactionInfo).
 
-use crate::schema::epoch_by_version::EpochByVersionSchema;
 use crate::{
     change_set::ChangeSet,
     errors::LibraDbError,
     schema::{
-        ledger_info::LedgerInfoSchema, transaction_accumulator::TransactionAccumulatorSchema,
+        epoch_by_version::EpochByVersionSchema, ledger_info::LedgerInfoSchema,
+        transaction_accumulator::TransactionAccumulatorSchema,
         transaction_info::TransactionInfoSchema,
     },
 };
 use accumulator::{HashReader, MerkleAccumulator};
+use anyhow::{ensure, format_err, Result};
 use arc_swap::ArcSwap;
-use failure::prelude::*;
 use itertools::Itertools;
 use libra_crypto::{
     hash::{CryptoHash, TransactionAccumulatorHasher},
     HashValue,
 };
 use libra_types::{
-    crypto_proxies::LedgerInfoWithSignatures,
+    ledger_info::LedgerInfoWithSignatures,
     proof::{
-        position::Position, AccumulatorConsistencyProof, TransactionAccumulatorProof,
-        TransactionAccumulatorRangeProof,
+        definition::LeafCount, position::Position, AccumulatorConsistencyProof,
+        TransactionAccumulatorProof, TransactionAccumulatorRangeProof,
     },
     transaction::{TransactionInfo, Version},
+    validator_set::ValidatorSet,
 };
-use schemadb::{ReadOptions, DB};
+use schemadb::{ReadOptions, SchemaIterator, DB};
 use std::{ops::Deref, sync::Arc};
+use storage_proto::{StartupInfo, TreeState};
 
 pub(crate) struct LedgerStore {
     db: Arc<DB>,
@@ -41,10 +43,6 @@ pub(crate) struct LedgerStore {
     latest_ledger_info: ArcSwap<Option<LedgerInfoWithSignatures>>,
 }
 
-// TODO: Either implement an iteration API to allow a very old client to loop through a long history
-// or guarantee that there is always a recent enough waypoint and client knows to boot from there.
-const MAX_NUM_EPOCH_CHANGE_LEDGER_INFO: usize = 100;
-
 impl LedgerStore {
     pub fn new(db: Arc<DB>) -> Self {
         // Upon restart, read the latest ledger info and signatures and cache them in memory.
@@ -52,7 +50,7 @@ impl LedgerStore {
             let mut iter = db
                 .iter::<LedgerInfoSchema>(ReadOptions::default())
                 .expect("Constructing iterator should work.");
-            iter.seek_to_last();
+            iter.seek_to_last().expect("Unable to seek to last entry!");
             iter.next()
                 .transpose()
                 .expect("Reading latest ledger info from DB should work.")
@@ -69,57 +67,70 @@ impl LedgerStore {
         let mut iter = self
             .db
             .iter::<EpochByVersionSchema>(ReadOptions::default())?;
+        // Search for the end of the previous epoch.
         iter.seek_for_prev(&version)?;
-        let (epoch_start_version, epoch) = iter
-            .next()
-            .transpose()?
-            .ok_or_else(|| LibraDbError::NotFound(format!("version {}", version)))?;
+        let (epoch_end_version, epoch) = match iter.next().transpose()? {
+            Some(x) => x,
+            None => {
+                // There should be a genesis LedgerInfo at version 0 (genesis only consists of one
+                // transaction), so this normally doesn't happen. However this part of
+                // implementation doesn't need to rely on this assumption.
+                return Ok(0);
+            }
+        };
         ensure!(
-            epoch_start_version <= version,
-            "DB corruption: looking for epoch at version {}, got epoch {} started at version {}",
+            epoch_end_version <= version,
+            "DB corruption: looking for epoch for version {}, got epoch {} ends at version {}",
             version,
             epoch,
-            epoch_start_version
+            epoch_end_version
         );
-        Ok(epoch)
+        // If the obtained epoch ended before the given version, return epoch+1, otherwise
+        // the given version is exactly the last version of the found epoch.
+        Ok(if epoch_end_version < version {
+            epoch + 1
+        } else {
+            epoch
+        })
     }
 
-    /// Return the ledger infos reflecting epoch bumps with their least 2f+1 signatures starting
-    /// from `start_epoch` to the most recent one.
-    /// Note: ledger infos and signatures are available at the last version of each earlier epoch
-    /// and at the latest version of current epoch, we filter out the latter.
-    pub fn get_epoch_change_ledger_infos(
+    /// Returns the ledger infos reflecting epoch bumps with their 2f+1 signatures in
+    /// [`start_epoch`, `end_epoch`). If there is no more than `limit` results, this function
+    /// returns all of them, otherwise the first `limit` results are returned and a flag
+    /// (when true) will be used to indicate the fact that there is more.
+    pub fn get_first_n_epoch_change_ledger_infos(
         &self,
         start_epoch: u64,
-        ledger_version: Version,
-    ) -> Result<Vec<LedgerInfoWithSignatures>> {
+        end_epoch: u64,
+        limit: usize,
+    ) -> Result<(Vec<LedgerInfoWithSignatures>, bool)> {
         let mut iter = self.db.iter::<LedgerInfoSchema>(ReadOptions::default())?;
         iter.seek(&start_epoch)?;
 
-        let mut result = Vec::new();
+        let mut results = Vec::new();
         for res in iter {
-            let (_epoch, ledger_info_with_sigs) = res?;
-            if ledger_info_with_sigs.ledger_info().version() > ledger_version {
+            let (epoch, ledger_info_with_sigs) = res?;
+            debug_assert_eq!(epoch, ledger_info_with_sigs.ledger_info().epoch());
+
+            if epoch >= end_epoch {
                 break;
             }
-            if ledger_info_with_sigs
-                .ledger_info()
-                .next_validator_set()
-                .is_none()
-            {
-                break;
+            if results.len() >= limit {
+                return Ok((results, true));
             }
-            if result.len() >= MAX_NUM_EPOCH_CHANGE_LEDGER_INFO {
-                return Err(LibraDbError::TooManyRequested(
-                    MAX_NUM_EPOCH_CHANGE_LEDGER_INFO as u64 + 1,
-                    MAX_NUM_EPOCH_CHANGE_LEDGER_INFO as u64,
-                )
-                .into());
-            }
-            result.push(ledger_info_with_sigs);
+
+            ensure!(
+                ledger_info_with_sigs
+                    .ledger_info()
+                    .next_validator_set()
+                    .is_some(),
+                "DB corruption: the last ledger info of epoch {} is missing next validator set",
+                epoch,
+            );
+            results.push(ledger_info_with_sigs);
         }
 
-        Ok(result)
+        Ok((results, false))
     }
 
     pub fn get_latest_ledger_info_option(&self) -> Option<LedgerInfoWithSignatures> {
@@ -138,6 +149,75 @@ impl LedgerStore {
             .store(Arc::new(Some(ledger_info_with_sigs)));
     }
 
+    fn get_validator_set(&self, epoch: u64) -> Result<ValidatorSet> {
+        ensure!(epoch > 0, "ValidatorSet only queryable for epoch >= 1.",);
+
+        let ledger_info_with_sigs =
+            self.db
+                .get::<LedgerInfoSchema>(&(epoch - 1))?
+                .ok_or_else(|| {
+                    LibraDbError::NotFound(format!("Last LedgerInfo of epoch {}", epoch - 1))
+                })?;
+        let latest_validator_set = ledger_info_with_sigs
+            .ledger_info()
+            .next_validator_set()
+            .ok_or_else(|| {
+                format_err!("Last LedgerInfo in epoch must carry next_validator_set.")
+            })?;
+
+        Ok(latest_validator_set.clone())
+    }
+
+    pub fn get_tree_state(
+        &self,
+        num_transactions: LeafCount,
+        transaction_info: TransactionInfo,
+    ) -> Result<TreeState> {
+        Ok(TreeState::new(
+            num_transactions,
+            Accumulator::get_frozen_subtree_hashes(self, num_transactions)?,
+            transaction_info.state_root_hash(),
+        ))
+    }
+
+    pub fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
+        // Get the latest ledger info. Return None if not bootstrapped.
+        let latest_ledger_info = match self.get_latest_ledger_info_option() {
+            Some(x) => x,
+            None => return Ok(None),
+        };
+        let latest_validator_set_if_not_in_li =
+            match latest_ledger_info.ledger_info().next_validator_set() {
+                Some(_) => None,
+                // If the latest LedgerInfo doesn't carry a validator set, we look for the previous
+                // LedgerInfo which should always carry a validator set.
+                None => Some(self.get_validator_set(latest_ledger_info.ledger_info().epoch())?),
+            };
+
+        let li_version = latest_ledger_info.ledger_info().version();
+        let (latest_version, latest_txn_info) = self.get_latest_transaction_info()?;
+        assert!(latest_version >= li_version);
+        let (commited_tree_state, synced_tree_state) = if latest_version == li_version {
+            (
+                self.get_tree_state(latest_version + 1, latest_txn_info)?,
+                None,
+            )
+        } else {
+            let commited_txn_info = self.get_transaction_info(li_version)?;
+            (
+                self.get_tree_state(li_version + 1, commited_txn_info)?,
+                Some(self.get_tree_state(latest_version + 1, latest_txn_info)?),
+            )
+        };
+
+        Ok(Some(StartupInfo::new(
+            latest_ledger_info,
+            latest_validator_set_if_not_in_li,
+            commited_tree_state,
+            synced_tree_state,
+        )))
+    }
+
     /// Get transaction info given `version`
     pub fn get_transaction_info(&self, version: Version) -> Result<TransactionInfo> {
         self.db
@@ -149,7 +229,7 @@ impl LedgerStore {
         let mut iter = self
             .db
             .iter::<TransactionInfoSchema>(ReadOptions::default())?;
-        iter.seek_to_last();
+        iter.seek_to_last()?;
         iter.next().transpose()
     }
 
@@ -158,6 +238,26 @@ impl LedgerStore {
     pub fn get_latest_transaction_info(&self) -> Result<(Version, TransactionInfo)> {
         self.get_latest_transaction_info_option()?
             .ok_or_else(|| LibraDbError::NotFound(String::from("Genesis TransactionInfo.")).into())
+    }
+
+    /// Gets an iterator that yields `num_transaction_infos` transaction infos starting from
+    /// `start_version`.
+    pub fn get_transaction_info_iter(
+        &self,
+        start_version: Version,
+        num_transaction_infos: u64,
+    ) -> Result<TransactionInfoIter> {
+        let mut iter = self
+            .db
+            .iter::<TransactionInfoSchema>(ReadOptions::default())?;
+        iter.seek(&start_version)?;
+        Ok(TransactionInfoIter {
+            inner: iter,
+            expected_next_version: start_version,
+            end_version: start_version
+                .checked_add(num_transaction_infos)
+                .ok_or_else(|| format_err!("Too many transaction infos requested."))?,
+        })
     }
 
     /// Get transaction info at `version` with proof towards root of ledger at `ledger_version`.
@@ -244,21 +344,14 @@ impl LedgerStore {
         let ledger_info = ledger_info_with_sigs.ledger_info();
 
         if ledger_info.next_validator_set().is_some() {
-            // Although the current block is under `epoch`, from now on the ledger is considered to
-            // be in `epoch+1`, this is useful in the case that the next block is empty (hence still
-            // has the same `version`)
+            // This is the last version of the current epoch, update the epoch by version index.
             cs.batch
-                .put::<EpochByVersionSchema>(&ledger_info.version(), &(ledger_info.epoch() + 1))?;
+                .put::<EpochByVersionSchema>(&ledger_info.version(), &ledger_info.epoch())?;
         }
         cs.batch.put::<LedgerInfoSchema>(
             &ledger_info_with_sigs.ledger_info().epoch(),
             ledger_info_with_sigs,
         )
-    }
-
-    /// From left to right, get frozen subtree root hashes of the transaction accumulator.
-    pub fn get_ledger_frozen_subtree_hashes(&self, version: Version) -> Result<Vec<HashValue>> {
-        Accumulator::get_frozen_subtree_hashes(self, version + 1)
     }
 }
 
@@ -269,6 +362,42 @@ impl HashReader for LedgerStore {
         self.db
             .get::<TransactionAccumulatorSchema>(&position)?
             .ok_or_else(|| format_err!("{} does not exist.", position))
+    }
+}
+
+pub struct TransactionInfoIter<'a> {
+    inner: SchemaIterator<'a, TransactionInfoSchema>,
+    expected_next_version: Version,
+    end_version: Version,
+}
+
+impl<'a> TransactionInfoIter<'a> {
+    fn next_impl(&mut self) -> Result<Option<TransactionInfo>> {
+        if self.expected_next_version >= self.end_version {
+            return Ok(None);
+        }
+
+        let ret = match self.inner.next().transpose()? {
+            Some((version, transaction_info)) => {
+                ensure!(
+                    version == self.expected_next_version,
+                    "Transaction info versions are not consecutive.",
+                );
+                self.expected_next_version += 1;
+                Some(transaction_info)
+            }
+            _ => None,
+        };
+
+        Ok(ret)
+    }
+}
+
+impl<'a> Iterator for TransactionInfoIter<'a> {
+    type Item = Result<TransactionInfo>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_impl().transpose()
     }
 }
 

@@ -7,9 +7,12 @@
 //! [`bls12381`] modules.
 
 use crate::HashValue;
+use anyhow::Result;
 use core::convert::{From, TryFrom};
-use failure::prelude::*;
+use rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng};
+use serde::{de::DeserializeOwned, Serialize};
 use std::{fmt::Debug, hash::Hash};
+use thiserror::Error;
 
 /// An error type for key and signature validation issues, see [`ValidKey`][ValidKey].
 ///
@@ -18,29 +21,32 @@ use std::{fmt::Debug, hash::Hash};
 /// (often, due to mangled material or curve equation failure for ECC) and
 /// validation errors (material recognizable but unacceptable for use,
 /// e.g. unsafe).
-#[derive(Clone, Debug, PartialEq, Eq, failure::prelude::Fail)]
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[error("{:?}", self)]
 pub enum CryptoMaterialError {
     /// Key or signature material does not deserialize correctly.
-    #[fail(display = "DeserializationError")]
     DeserializationError,
     /// Key or signature material deserializes, but is otherwise not valid.
-    #[fail(display = "ValidationError")]
     ValidationError,
-    /// Key or signature material does not have the expected size.
-    #[fail(display = "WrongLengthError")]
+    /// Key, threshold or signature material does not have the expected size.
     WrongLengthError,
     /// Part of the signature or key is not canonical resulting to malleability issues.
-    #[fail(display = "CanonicalRepresentationError")]
     CanonicalRepresentationError,
     /// A curve point (i.e., a public key) lies on a small group.
-    #[fail(display = "SmallSubgroupError")]
     SmallSubgroupError,
     /// A curve point (i.e., a public key) does not satisfy the curve equation.
-    #[fail(display = "PointNotOnCurveError")]
     PointNotOnCurveError,
+    /// BitVec errors in accountable multi-sig schemes.
+    BitVecError(String),
 }
 
-/// Key material with a notion of byte validation.
+/// The serialized length of the data that enables macro derived serialization and deserialization.
+pub trait Length {
+    /// The serialized length of the data
+    fn length(&self) -> usize;
+}
+
+/// Key or more generally crypto material with a notion of byte validation.
 ///
 /// A type family for material that knows how to serialize and
 /// deserialize, as well as validate byte-encoded material. The
@@ -52,9 +58,8 @@ pub enum CryptoMaterialError {
 /// round-trip to bytes and corresponding [`TryFrom`][TryFrom].
 pub trait ValidKey:
     // The for<'a> exactly matches the assumption "deserializable from any lifetime".
-    for<'a> TryFrom<&'a [u8], Error = CryptoMaterialError> + Debug
+    for<'a> TryFrom<&'a [u8], Error = CryptoMaterialError> + Debug + Serialize + DeserializeOwned
 {
-
     /// Convert the valid key to bytes.
     fn to_bytes(&self) -> Vec<u8>;
 }
@@ -220,10 +225,21 @@ pub trait Signature:
 /// A type family for schemes which know how to generate key material from
 /// a cryptographically-secure [`CryptoRng`][::rand::CryptoRng].
 pub trait Uniform {
-    /// Generate key material from an RNG for testing purposes.
-    fn generate_for_testing<R>(rng: &mut R) -> Self
+    /// Generate key material from an RNG. This should generally not be used for production
+    /// purposes even with a good source of randomness. When possible use hardware crypto to generate and
+    /// store private keys.
+    fn generate<R>(rng: &mut R) -> Self
     where
-        R: ::rand::SeedableRng + ::rand::RngCore + ::rand::CryptoRng;
+        R: SeedableRng + RngCore + CryptoRng;
+
+    /// Generate a random key using the shared TEST_SEED
+    fn generate_for_testing() -> Self
+    where
+        Self: Sized,
+    {
+        let mut rng: StdRng = SeedableRng::from_seed(crate::test_utils::TEST_SEED);
+        Self::generate(&mut rng)
+    }
 }
 
 /// A type family with a by-convention notion of genesis private key.

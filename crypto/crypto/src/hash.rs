@@ -88,17 +88,17 @@
 //! }
 //! ```
 
+use anyhow::{ensure, Result};
 use bytes::Bytes;
-use failure::prelude::*;
-use lazy_static::lazy_static;
 use libra_nibble::Nibble;
 use mirai_annotations::*;
+use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use rand::{rngs::EntropyRng, Rng};
 use serde::{de, ser};
 use std::{self, convert::AsRef, fmt};
-use tiny_keccak::Keccak;
+use tiny_keccak::{Hasher, Sha3};
 
 const LIBRA_HASH_SUFFIX: &[u8] = b"@@$$LIBRA$$@@";
 
@@ -175,7 +175,7 @@ impl HashValue {
     /// Convenience function to compute a sha3-256 HashValue of the buffer. It will handle hasher
     /// creation, data feeding and finalization.
     pub fn from_sha3_256(buffer: &[u8]) -> Self {
-        let mut sha3 = Keccak::new_sha3_256();
+        let mut sha3 = Sha3::v256();
         sha3.update(buffer);
         HashValue::from_keccak(sha3)
     }
@@ -185,7 +185,7 @@ impl HashValue {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
-        let mut sha3 = Keccak::new_sha3_256();
+        let mut sha3 = Sha3::v256();
         for buffer in buffers {
             sha3.update(buffer);
         }
@@ -196,7 +196,7 @@ impl HashValue {
         &mut self.hash[..]
     }
 
-    fn from_keccak(state: Keccak) -> Self {
+    fn from_keccak(state: Sha3) -> Self {
         let mut hash = Self::zero();
         state.finalize(hash.as_ref_mut());
         hash
@@ -249,7 +249,17 @@ impl HashValue {
 
     /// Returns first SHORT_STRING_LENGTH bytes as String in hex
     pub fn short_str(&self) -> String {
-        hex::encode(&self.hash[0..SHORT_STRING_LENGTH]).to_string()
+        hex::encode(&self.hash[0..SHORT_STRING_LENGTH])
+    }
+
+    /// Full hex representation of a given hash value.
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.hash)
+    }
+
+    /// Parse a given hex string to a hash value.
+    pub fn from_hex(hex_str: &str) -> Result<Self> {
+        Self::from_slice(hex::decode(hex_str)?.as_slice())
     }
 }
 
@@ -259,7 +269,14 @@ impl ser::Serialize for HashValue {
     where
         S: ser::Serializer,
     {
-        serializer.serialize_bytes(&self.hash[..])
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_hex())
+        } else {
+            // In order to preserve the Serde data model and help analysis tools,
+            // make sure to wrap our value in a container with the same name
+            // as the original type.
+            serializer.serialize_newtype_struct("HashValue", &self.hash[..])
+        }
     }
 }
 
@@ -268,23 +285,18 @@ impl<'de> de::Deserialize<'de> for HashValue {
     where
         D: de::Deserializer<'de>,
     {
-        struct HashValueVisitor;
-        impl<'de> de::Visitor<'de> for HashValueVisitor {
-            type Value = HashValue;
+        if deserializer.is_human_readable() {
+            let encoded_hash = <&str>::deserialize(deserializer)?;
+            HashValue::from_hex(encoded_hash).map_err(<D::Error as ::serde::de::Error>::custom)
+        } else {
+            // See comment in serialize.
+            #[derive(::serde::Deserialize)]
+            #[serde(rename = "HashValue")]
+            struct Value<'a>(&'a [u8]);
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("HashValue in bytes")
-            }
-
-            fn visit_bytes<E>(self, value: &[u8]) -> std::result::Result<HashValue, E>
-            where
-                E: de::Error,
-            {
-                HashValue::from_slice(value).map_err(E::custom)
-            }
+            let value = Value::deserialize(deserializer)?;
+            Self::from_slice(value.0).map_err(<D::Error as ::serde::de::Error>::custom)
         }
-
-        deserializer.deserialize_bytes(HashValueVisitor)
     }
 }
 
@@ -437,7 +449,7 @@ pub trait CryptoHasher: Default {
 /// * Only used internally within this crate
 #[derive(Clone)]
 pub struct DefaultHasher {
-    state: Keccak,
+    state: Sha3,
 }
 
 impl CryptoHasher for DefaultHasher {
@@ -456,7 +468,7 @@ impl CryptoHasher for DefaultHasher {
 impl Default for DefaultHasher {
     fn default() -> Self {
         DefaultHasher {
-            state: Keccak::new_sha3_256(),
+            state: Sha3::v256(),
         }
     }
 }
@@ -464,7 +476,7 @@ impl Default for DefaultHasher {
 impl DefaultHasher {
     /// initialize a new hasher with a specific salt
     pub fn new_with_salt(typename: &[u8]) -> Self {
-        let mut state = Keccak::new_sha3_256();
+        let mut state = Sha3::v256();
         if !typename.is_empty() {
             let mut salt = typename.to_vec();
             salt.extend_from_slice(LIBRA_HASH_SUFFIX);
@@ -507,9 +519,7 @@ macro_rules! define_hasher {
             }
         }
 
-        lazy_static! {
-            static ref $hasher_name: $hasher_type = { $hasher_type::new() };
-        }
+        static $hasher_name: Lazy<$hasher_type> = Lazy::new(|| { $hasher_type::new() });
     };
 }
 
@@ -557,29 +567,28 @@ fn create_literal_hash(word: &str) -> HashValue {
     HashValue::from_slice(&s).expect("Cannot fail")
 }
 
-lazy_static! {
-    /// Placeholder hash of `Accumulator`.
-    pub static ref ACCUMULATOR_PLACEHOLDER_HASH: HashValue =
-        create_literal_hash("ACCUMULATOR_PLACEHOLDER_HASH");
+/// Placeholder hash of `Accumulator`.
+pub static ACCUMULATOR_PLACEHOLDER_HASH: Lazy<HashValue> =
+    Lazy::new(|| create_literal_hash("ACCUMULATOR_PLACEHOLDER_HASH"));
 
-    /// Placeholder hash of `SparseMerkleTree`.
-    pub static ref SPARSE_MERKLE_PLACEHOLDER_HASH: HashValue =
-        create_literal_hash("SPARSE_MERKLE_PLACEHOLDER_HASH");
+/// Placeholder hash of `SparseMerkleTree`.
+pub static SPARSE_MERKLE_PLACEHOLDER_HASH: Lazy<HashValue> =
+    Lazy::new(|| create_literal_hash("SPARSE_MERKLE_PLACEHOLDER_HASH"));
 
-    /// Block id reserved as the id of parent block of the genesis block.
-    pub static ref PRE_GENESIS_BLOCK_ID: HashValue =
-        create_literal_hash("PRE_GENESIS_BLOCK_ID");
+/// Block id reserved as the id of parent block of the genesis block.
+pub static PRE_GENESIS_BLOCK_ID: Lazy<HashValue> =
+    Lazy::new(|| create_literal_hash("PRE_GENESIS_BLOCK_ID"));
 
-    /// Genesis block id is used as a parent of the very first block executed by the executor.
-    pub static ref GENESIS_BLOCK_ID: HashValue =
-        // This maintains the invariant that block.id() == block.hash(), for
-        // the genesis block and allows us to (de/)serialize it consistently
-        HashValue::new([
-            0x5e, 0x10, 0xba, 0xd4, 0x5b, 0x35, 0xed, 0x92, 0x9c, 0xd6, 0xd2,
-            0xc7, 0x09, 0x8b, 0x13, 0x5d, 0x02, 0xdd, 0x25, 0x9a, 0xe8, 0x8a,
-            0x8d, 0x09, 0xf4, 0xeb, 0x5f, 0xba, 0xe9, 0xa6, 0xf6, 0xe4
-        ]);
-}
+/// Genesis block id is used as a parent of the very first block executed by the executor.
+pub static GENESIS_BLOCK_ID: Lazy<HashValue> = Lazy::new(|| {
+    // This maintains the invariant that block.id() == block.hash(), for
+    // the genesis block and allows us to (de/)serialize it consistently
+    HashValue::new([
+        0x5e, 0x10, 0xba, 0xd4, 0x5b, 0x35, 0xed, 0x92, 0x9c, 0xd6, 0xd2, 0xc7, 0x09, 0x8b, 0x13,
+        0x5d, 0x02, 0xdd, 0x25, 0x9a, 0xe8, 0x8a, 0x8d, 0x09, 0xf4, 0xeb, 0x5f, 0xba, 0xe9, 0xa6,
+        0xf6, 0xe4,
+    ])
+});
 
 /// Provides a test_only_hash() method that can be used in tests on types that implement
 /// `serde::Serialize`.

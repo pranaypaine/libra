@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::hash::*;
-use bitvec::BitVec;
-use byteorder::{LittleEndian, WriteBytesExt};
+use bitvec::prelude::*;
 use proptest::{collection::vec, prelude::*};
 use rand::{rngs::StdRng, SeedableRng};
 use serde::Serialize;
@@ -31,17 +30,17 @@ fn test_default_hasher() {
 fn test_primitive_type() {
     let x = 0xf312_u16;
     let mut wtr: Vec<u8> = vec![];
-    wtr.write_u16::<LittleEndian>(x).unwrap();
+    wtr.extend_from_slice(&x.to_le_bytes());
     assert_eq!(x.test_only_hash(), HashValue::from_sha3_256(&wtr[..]));
 
     let x = 0x_ff001234_u32;
     let mut wtr: Vec<u8> = vec![];
-    wtr.write_u32::<LittleEndian>(x).unwrap();
+    wtr.extend_from_slice(&x.to_le_bytes());
     assert_eq!(x.test_only_hash(), HashValue::from_sha3_256(&wtr[..]));
 
     let x = 0x_89abcdef_01234567_u64;
     let mut wtr: Vec<u8> = vec![];
-    wtr.write_u64::<LittleEndian>(x).unwrap();
+    wtr.extend_from_slice(&x.to_le_bytes());
     assert_eq!(x.test_only_hash(), HashValue::from_sha3_256(&wtr[..]));
 }
 
@@ -222,7 +221,7 @@ fn test_common_prefix_nibbles_len() {
 proptest! {
     #[test]
     fn test_hashvalue_to_bits_roundtrip(hash in any::<HashValue>()) {
-        let bitvec: BitVec = hash.iter_bits().collect();
+        let bitvec: BitVec<Msb0, u8>  = hash.iter_bits().collect();
         let bytes: Vec<u8> = bitvec.into();
         let hash2 = HashValue::from_slice(&bytes).unwrap();
         prop_assert_eq!(hash, hash2);
@@ -230,7 +229,7 @@ proptest! {
 
     #[test]
     fn test_hashvalue_to_bits_inverse_roundtrip(bits in vec(any::<bool>(), HashValue::LENGTH_IN_BITS)) {
-        let bitvec: BitVec = bits.iter().cloned().collect();
+        let bitvec: BitVec<Msb0, u8> = bits.iter().cloned().collect();
         let bytes: Vec<u8> = bitvec.into();
         let hash = HashValue::from_slice(&bytes).unwrap();
         let bits2: Vec<bool> = hash.iter_bits().collect();
@@ -247,7 +246,7 @@ proptest! {
 
     #[test]
     fn test_hashvalue_to_rev_bits_roundtrip(hash in any::<HashValue>()) {
-        let bitvec: BitVec<bitvec::LittleEndian> = hash.iter_bits().rev().collect();
+        let bitvec: BitVec<Lsb0, u8> = hash.iter_bits().rev().collect();
         let mut bytes: Vec<u8> = bitvec.into();
         bytes.reverse();
         let hash2 = HashValue::from_slice(&bytes).unwrap();

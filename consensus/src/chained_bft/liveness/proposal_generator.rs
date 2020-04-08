@@ -7,13 +7,13 @@ use crate::{
     state_replication::TxnManager,
     util::time_service::{wait_if_possible, TimeService, WaitingError, WaitingSuccess},
 };
+use anyhow::{bail, ensure, format_err, Context};
 use consensus_types::{
     block::Block,
     block_data::BlockData,
     common::{Author, Payload, Round},
     quorum_cert::QuorumCert,
 };
-use failure::ResultExt;
 use libra_logger::prelude::*;
 use std::{
     sync::{Arc, Mutex},
@@ -40,7 +40,7 @@ pub struct ProposalGenerator<T> {
     // proposed block.
     block_store: Arc<dyn BlockReader<Payload = T> + Send + Sync>,
     // Transaction manager is delivering the transactions.
-    txn_manager: Arc<dyn TxnManager<Payload = T>>,
+    txn_manager: Box<dyn TxnManager<Payload = T>>,
     // Time service to generate block timestamps
     time_service: Arc<dyn TimeService>,
     // Max number of transactions to be added to a proposed block.
@@ -53,7 +53,7 @@ impl<T: Payload> ProposalGenerator<T> {
     pub fn new(
         author: Author,
         block_store: Arc<dyn BlockReader<Payload = T> + Send + Sync>,
-        txn_manager: Arc<dyn TxnManager<Payload = T>>,
+        txn_manager: Box<dyn TxnManager<Payload = T>>,
         time_service: Arc<dyn TimeService>,
         max_block_size: u64,
     ) -> Self {
@@ -72,9 +72,22 @@ impl<T: Payload> ProposalGenerator<T> {
     }
 
     /// Creates a NIL block proposal extending the highest certified block from the block store.
-    pub fn generate_nil_block(&self, round: Round) -> failure::Result<Block<T>> {
+    pub fn generate_nil_block(&self, round: Round) -> anyhow::Result<Block<T>> {
         let hqc = self.ensure_highest_quorum_cert(round)?;
         Ok(Block::new_nil(round, hqc.as_ref().clone()))
+    }
+
+    /// Reconfiguration rule - we propose empty blocks with parents' timestamp
+    /// after reconfiguration until it's committed
+    pub fn generate_reconfig_empty_suffix(&self, round: Round) -> anyhow::Result<BlockData<T>> {
+        let hqc = self.ensure_highest_quorum_cert(round)?;
+        Ok(BlockData::new_proposal(
+            T::default(),
+            self.author,
+            round,
+            hqc.certified_block().timestamp_usecs(),
+            hqc.as_ref().clone(),
+        ))
     }
 
     /// The function generates a new proposal block: the returned future is fulfilled when the
@@ -88,10 +101,10 @@ impl<T: Payload> ProposalGenerator<T> {
     /// 3. In case a given round is not greater than the calculated parent, return an OldRound
     /// error.
     pub async fn generate_proposal(
-        &self,
+        &mut self,
         round: Round,
         round_deadline: Instant,
-    ) -> failure::Result<BlockData<T>> {
+    ) -> anyhow::Result<BlockData<T>> {
         {
             let mut last_round_generated = self.last_round_generated.lock().unwrap();
             if *last_round_generated < round {
@@ -103,10 +116,9 @@ impl<T: Payload> ProposalGenerator<T> {
 
         let hqc = self.ensure_highest_quorum_cert(round)?;
 
-        ensure!(
-            !hqc.ends_epoch(),
-            "The epoch has already ended,a proposal is not allowed to generated"
-        );
+        if hqc.certified_block().has_reconfiguration() {
+            return self.generate_reconfig_empty_suffix(round);
+        }
 
         // One needs to hold the blocks with the references to the payloads while get_block is
         // being executed: pending blocks vector keeps all the pending ancestors of the extended
@@ -190,17 +202,12 @@ impl<T: Payload> ProposalGenerator<T> {
                 }
             }
         };
-        // Reconfiguration rule - we propose empty blocks after reconfiguration until it's committed
-        let txns = if self.block_store.root().id() != hqc.certified_block().id()
-            && hqc.certified_block().has_reconfiguration()
-        {
-            T::default()
-        } else {
-            self.txn_manager
-                .pull_txns(self.max_block_size, exclude_payload)
-                .await
-                .with_context(|e| format!("Fail to retrieve txn: {}", e))?
-        };
+
+        let txns = self
+            .txn_manager
+            .pull_txns(self.max_block_size, exclude_payload)
+            .await
+            .context("Fail to retrieve txn")?;
 
         Ok(BlockData::new_proposal(
             txns,
@@ -211,7 +218,7 @@ impl<T: Payload> ProposalGenerator<T> {
         ))
     }
 
-    fn ensure_highest_quorum_cert(&self, round: Round) -> failure::Result<Arc<QuorumCert>> {
+    fn ensure_highest_quorum_cert(&self, round: Round) -> anyhow::Result<Arc<QuorumCert>> {
         let hqc = self.block_store.highest_quorum_cert();
         ensure!(
             hqc.certified_block().round() < round,
@@ -219,6 +226,11 @@ impl<T: Payload> ProposalGenerator<T> {
             round,
             hqc.certified_block().round()
         );
+        ensure!(
+            !hqc.ends_epoch(),
+            "The epoch has already ended,a proposal is not allowed to generated"
+        );
+
         Ok(hqc)
     }
 }

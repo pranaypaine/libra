@@ -1,8 +1,11 @@
 error: 
 
-   ┌── tests/move_check/expansion/type_arguments_on_field_access.move:6:9 ───
+   ┌── tests/move_check/expansion/type_arguments_on_field_access.move:6:17 ───
    │
  6 │         x.f<u64>;
-   │         ^^^^^^^^ Unexpected type arguments. Thus, expected a function applied to its arguments
+   │                 ^ Unexpected ';'
+   ·
+ 6 │         x.f<u64>;
+   │                 - Expected an expression term
    │
 

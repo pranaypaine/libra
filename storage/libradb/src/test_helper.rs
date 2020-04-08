@@ -4,13 +4,11 @@
 //! This module provides reusable helpers in tests.
 
 use super::*;
-use crate::mock_genesis::{db_with_mock_genesis, GENESIS_INFO};
 use libra_crypto::hash::CryptoHash;
-use libra_tools::tempdir::TempPath;
-use libra_types::block_info::BlockInfo;
+use libra_temppath::TempPath;
 use libra_types::{
-    crypto_proxies::LedgerInfoWithSignatures,
-    ledger_info::LedgerInfo,
+    block_info::BlockInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     proptest_types::{AccountInfoUniverse, LedgerInfoWithSignaturesGen, TransactionToCommitGen},
 };
 use proptest::{collection::vec, prelude::*};
@@ -21,17 +19,14 @@ fn to_blocks_to_commit(
     // Use temporary LibraDB and STORE LEVEL APIs to calculate hashes on a per transaction basis.
     // Result is used to test the batch PUBLIC API for saving everything, i.e. `save_transactions()`
     let tmp_dir = TempPath::new();
-    let db = db_with_mock_genesis(&tmp_dir.path())?;
+    let db = LibraDB::new(&tmp_dir);
 
-    let genesis_ledger_info_with_sigs = GENESIS_INFO.1.clone();
-    let genesis_ledger_info = genesis_ledger_info_with_sigs.ledger_info();
     let mut cur_ver = 0;
-    let mut cur_txn_accu_hash = genesis_ledger_info.transaction_accumulator_hash();
+    let mut cur_txn_accu_hash = HashValue::zero();
     let blocks_to_commit = partial_blocks
         .into_iter()
         .map(|(txns_to_commit, partial_ledger_info_with_sigs)| {
             for txn_to_commit in txns_to_commit.iter() {
-                cur_ver += 1;
                 let mut cs = ChangeSet::new();
 
                 let txn_hash = txn_to_commit.transaction().hash();
@@ -56,12 +51,13 @@ fn to_blocks_to_commit(
                         .put_transaction_infos(cur_ver, &[txn_info], &mut cs)?;
                 db.db.write_schemas(cs.batch)?;
 
+                cur_ver += 1;
                 cur_txn_accu_hash = txn_accu_hash;
             }
 
             let partial_ledger_info = partial_ledger_info_with_sigs.ledger_info();
             let signatures = partial_ledger_info_with_sigs.signatures().clone();
-            assert_eq!(cur_ver, partial_ledger_info.version());
+            assert_eq!(cur_ver, partial_ledger_info.version() + 1);
 
             let block_info = BlockInfo::new(
                 partial_ledger_info.epoch(),
@@ -89,14 +85,18 @@ prop_compose! {
     ///
     /// It is used in tests for both transaction block committing during normal running and
     /// transaction syncing during start up.
-    pub fn arb_blocks_to_commit()(
-        mut universe in any_with::<AccountInfoUniverse>(5).no_shrink(),
+    pub fn arb_blocks_to_commit_impl(
+        num_accounts: usize,
+        max_txn_per_block: usize,
+        max_blocks: usize,
+    )(
+        mut universe in any_with::<AccountInfoUniverse>(num_accounts).no_shrink(),
         batches in vec(
             (
-                vec(any::<TransactionToCommitGen>(), 0..=2),
+                vec(any::<TransactionToCommitGen>(), 1..=max_txn_per_block),
                 any::<LedgerInfoWithSignaturesGen>(),
             ),
-            1..10,
+            1..=max_blocks,
         ),
     ) ->
         Vec<(
@@ -120,4 +120,27 @@ prop_compose! {
 
         to_blocks_to_commit(partial_blocks).unwrap()
     }
+}
+
+pub fn arb_blocks_to_commit(
+) -> impl Strategy<Value = Vec<(Vec<TransactionToCommit>, LedgerInfoWithSignatures)>> {
+    arb_blocks_to_commit_impl(
+        5,  /* num_accounts */
+        2,  /* max_txn_per_block */
+        10, /* max_blocks */
+    )
+}
+
+pub fn arb_mock_genesis() -> impl Strategy<Value = (TransactionToCommit, LedgerInfoWithSignatures)>
+{
+    arb_blocks_to_commit_impl(
+        1, /* num_accounts */
+        1, /* max_txn_per_block */
+        1, /* max_blocks */
+    )
+    .prop_map(|blocks| {
+        let (block, ledger_info_with_sigs) = &blocks[0];
+
+        (block[0].clone(), ledger_info_with_sigs.clone())
+    })
 }

@@ -1,14 +1,12 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 //! All proofs generated in this module are not valid proofs. They are only for the purpose of
 //! testing conversion between Rust and Protobuf.
 
 use crate::proof::{
     definition::MAX_ACCUMULATOR_PROOF_DEPTH, AccumulatorConsistencyProof, AccumulatorProof,
-    AccumulatorRangeProof, SparseMerkleProof,
+    AccumulatorRangeProof, SparseMerkleProof, SparseMerkleRangeProof,
 };
 use libra_crypto::{
     hash::{CryptoHasher, ACCUMULATOR_PLACEHOLDER_HASH, SPARSE_MERKLE_PLACEHOLDER_HASH},
@@ -131,6 +129,17 @@ where
             .prop_map(|(left_siblings, right_siblings)| {
                 AccumulatorRangeProof::new(left_siblings, right_siblings)
             })
+            .boxed()
+    }
+}
+
+impl Arbitrary for SparseMerkleRangeProof {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        vec(arb_sparse_merkle_sibling(), 0..=256)
+            .prop_map(Self::new)
             .boxed()
     }
 }

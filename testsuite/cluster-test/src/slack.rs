@@ -3,24 +3,21 @@
 
 #![forbid(unsafe_code)]
 
-use failure::{
-    self,
-    prelude::{bail, format_err},
-};
+use anyhow::{bail, format_err, Result};
 use reqwest::{self, Url};
 use serde_json::{self, json};
 
 pub struct SlackClient {
-    client: reqwest::Client,
+    client: reqwest::blocking::Client,
 }
 
 impl SlackClient {
     pub fn new() -> Self {
-        let client = reqwest::Client::new();
+        let client = reqwest::blocking::Client::new();
         Self { client }
     }
 
-    pub fn send_message(&self, url: &Url, msg: &str) -> failure::Result<()> {
+    pub fn send_message(&self, url: &Url, msg: &str) -> Result<()> {
         let msg = json!({ "text": msg });
         let msg = serde_json::to_string(&msg)
             .map_err(|e| format_err!("Failed to serialize message for slack: {:?}", e))?;
@@ -32,5 +29,11 @@ impl SlackClient {
             bail!("Slack service returned error code: {}", response.status())
         }
         Ok(())
+    }
+}
+
+impl Default for SlackClient {
+    fn default() -> Self {
+        Self::new()
     }
 }

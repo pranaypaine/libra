@@ -5,24 +5,26 @@ use crate::{
     common::NetworkPublicKeys,
     protocols::identity::{exchange_identity, Identity},
 };
+use futures::io::{AsyncRead, AsyncWrite};
 use libra_crypto::{
     x25519::{X25519StaticPrivateKey, X25519StaticPublicKey},
     ValidKey,
 };
-use libra_logger::prelude::*;
+use libra_security_logger::{security_log, SecurityEvent};
 use libra_types::PeerId;
-use netcore::{
-    multiplexing::{yamux::Yamux, StreamMultiplexer},
-    transport::{boxed, memory, tcp, TransportExt},
-};
+use netcore::transport::{boxed, memory, tcp, TransportExt};
 use noise::NoiseConfig;
 use std::{
     collections::HashMap,
     convert::TryFrom,
+    fmt::Debug,
     io,
     sync::{Arc, RwLock},
     time::Duration,
 };
+
+pub trait TSocket: AsyncRead + AsyncWrite + Send + Debug + Unpin + 'static {}
+impl<T> TSocket for T where T: AsyncRead + AsyncWrite + Send + Debug + Unpin + 'static {}
 
 /// A timeout for the connection to open and complete all of the upgrade steps.
 pub const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -71,65 +73,36 @@ fn match_peer_id(identity: Identity, peer_id: PeerId) -> Result<Identity, io::Er
     }
 }
 
-// Ensures that connected peer has the same role as self.
-fn check_role(own_identity: &Identity, other_identity: Identity) -> Result<Identity, io::Error> {
-    if other_identity.role() != own_identity.role() {
-        Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "Role of connected peer({}): {:?} does not match self role: {:?}",
-                other_identity.peer_id().short_str(),
-                other_identity.role(),
-                own_identity.role(),
-            ),
-        ))
-    } else {
-        Ok(other_identity)
-    }
-}
-
 pub fn build_memory_noise_transport(
     own_identity: Identity,
     identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+) -> boxed::BoxedTransport<(Identity, impl TSocket), impl ::std::error::Error> {
     let memory_transport = memory::MemoryTransport::default();
     let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
 
     memory_transport
-        .and_then(move |socket, origin| {
-            async move {
-                let (remote_static_key, socket) =
-                    noise_config.upgrade_connection(socket, origin).await?;
-                if let Some(peer_id) = identity_key_to_peer_id(&trusted_peers, &remote_static_key) {
-                    Ok((peer_id, socket))
-                } else {
-                    Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
-                }
+        .and_then(move |socket, origin| async move {
+            let (remote_static_key, socket) =
+                noise_config.upgrade_connection(socket, origin).await?;
+            if let Some(peer_id) = identity_key_to_peer_id(&trusted_peers, &remote_static_key) {
+                Ok((peer_id, socket))
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, mut socket), _origin| async move {
+            let identity = exchange_identity(&own_identity, &mut socket).await?;
+            match_peer_id(identity, peer_id).and_then(|identity| Ok((identity, socket)))
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
 }
 
-pub fn build_permissionless_memory_noise_transport(
+pub fn build_unauthenticated_memory_noise_transport(
     own_identity: Identity,
     identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+) -> boxed::BoxedTransport<(Identity, impl TSocket), impl ::std::error::Error> {
     let memory_transport = memory::MemoryTransport::default();
     let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
     memory_transport
@@ -140,27 +113,17 @@ pub fn build_permissionless_memory_noise_transport(
                 // Generate PeerId from X25519StaticPublicKey.
                 // Note: This is inconsistent with current types because AccountAddress is derived
                 // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
-                // not mean anything in the permissionless setting, we use the network public key
-                // to generate a peer_id for the peer. The only reason this works is that both are
-                // 32 bytes in size. If/when this condition no longer holds, we will receive an
-                // error.
+                // not mean anything in a setting without remote authentication, we use the network
+                // public key to generate a peer_id for the peer. The only reason this works is
+                // that both are 32 bytes in size. If/when this condition no longer holds, we will
+                // receive an error.
                 let peer_id = PeerId::try_from(remote_static_key).unwrap();
                 Ok((peer_id, socket))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, mut socket), _origin| async move {
+            let identity = exchange_identity(&own_identity, &mut socket).await?;
+            match_peer_id(identity, peer_id).and_then(|identity| Ok((identity, socket)))
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
@@ -168,21 +131,11 @@ pub fn build_permissionless_memory_noise_transport(
 
 pub fn build_memory_transport(
     own_identity: Identity,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+) -> boxed::BoxedTransport<(Identity, impl TSocket), impl ::std::error::Error> {
     let memory_transport = memory::MemoryTransport::default();
-
     memory_transport
-        .and_then(|socket, origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok(muxer)
-            }
-        })
-        .and_then(move |muxer, origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                check_role(&own_identity, identity).and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |mut socket, _origin| async move {
+            Ok((exchange_identity(&own_identity, &mut socket).await?, socket))
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
@@ -193,49 +146,38 @@ pub fn build_tcp_noise_transport(
     own_identity: Identity,
     identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+) -> boxed::BoxedTransport<(Identity, impl TSocket), impl ::std::error::Error> {
     let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
 
     LIBRA_TCP_TRANSPORT
-        .and_then(move |socket, origin| {
-            async move {
-                let (remote_static_key, socket) =
-                    noise_config.upgrade_connection(socket, origin).await?;
-                if let Some(peer_id) = identity_key_to_peer_id(&trusted_peers, &remote_static_key) {
-                    Ok((peer_id, socket))
-                } else {
-                    security_log(SecurityEvent::InvalidNetworkPeer)
-                        .error("UntrustedPeer")
-                        .data(&trusted_peers)
-                        .data(&remote_static_key)
-                        .log();
-                    Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
-                }
+        .and_then(move |socket, origin| async move {
+            let (remote_static_key, socket) =
+                noise_config.upgrade_connection(socket, origin).await?;
+            if let Some(peer_id) = identity_key_to_peer_id(&trusted_peers, &remote_static_key) {
+                Ok((peer_id, socket))
+            } else {
+                security_log(SecurityEvent::InvalidNetworkPeer)
+                    .error("UntrustedPeer")
+                    .data(&trusted_peers)
+                    .data(&remote_static_key)
+                    .log();
+                Err(io::Error::new(io::ErrorKind::Other, "Not a trusted peer"))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, mut socket), _origin| async move {
+            let identity = exchange_identity(&own_identity, &mut socket).await?;
+            match_peer_id(identity, peer_id).and_then(|identity| Ok((identity, socket)))
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
 }
 
-// Transport based on TCP + Noise, but permissionless -- i.e., any node is allowed to connect.
-pub fn build_permissionless_tcp_noise_transport(
+// Transport based on TCP + Noise, but without remote authentication (i.e., any
+// node is allowed to connect).
+pub fn build_unauthenticated_tcp_noise_transport(
     own_identity: Identity,
     identity_keypair: (X25519StaticPrivateKey, X25519StaticPublicKey),
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+) -> boxed::BoxedTransport<(Identity, impl TSocket), impl ::std::error::Error> {
     let noise_config = Arc::new(NoiseConfig::new(identity_keypair));
     LIBRA_TCP_TRANSPORT
         .and_then(move |socket, origin| {
@@ -245,27 +187,17 @@ pub fn build_permissionless_tcp_noise_transport(
                 // Generate PeerId from X25519StaticPublicKey.
                 // Note: This is inconsistent with current types because AccountAddress is derived
                 // from consensus key which is of type Ed25519PublicKey. Since AccountAddress does
-                // not mean anything in the permissionless setting, we use the network public key
-                // to generate a peer_id for the peer. The only reason this works is that both are
-                // 32 bytes in size. If/when this condition no longer holds, we will receive an
-                // error.
+                // not mean anything in a setting without remote authentication, we use the network
+                // public key to generate a peer_id for the peer. The only reason this works is that
+                // both are 32 bytes in size. If/when this condition no longer holds, we will receive
+                // an error.
                 let peer_id = PeerId::try_from(remote_static_key).unwrap();
                 Ok((peer_id, socket))
             }
         })
-        .and_then(|(peer_id, socket), origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok((peer_id, muxer))
-            }
-        })
-        .and_then(move |(peer_id, muxer), origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                match_peer_id(identity, peer_id)
-                    .and_then(|identity| check_role(&own_identity, identity))
-                    .and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |(peer_id, mut socket), _origin| async move {
+            let identity = exchange_identity(&own_identity, &mut socket).await?;
+            match_peer_id(identity, peer_id).and_then(|identity| Ok((identity, socket)))
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()
@@ -273,19 +205,10 @@ pub fn build_permissionless_tcp_noise_transport(
 
 pub fn build_tcp_transport(
     own_identity: Identity,
-) -> boxed::BoxedTransport<(Identity, impl StreamMultiplexer), impl ::std::error::Error> {
+) -> boxed::BoxedTransport<(Identity, impl TSocket), impl ::std::error::Error> {
     LIBRA_TCP_TRANSPORT
-        .and_then(|socket, origin| {
-            async move {
-                let muxer = Yamux::upgrade_connection(socket, origin).await?;
-                Ok(muxer)
-            }
-        })
-        .and_then(move |muxer, origin| {
-            async move {
-                let (identity, muxer) = exchange_identity(&own_identity, muxer, origin).await?;
-                check_role(&own_identity, identity).and_then(|identity| Ok((identity, muxer)))
-            }
+        .and_then(move |mut socket, _origin| async move {
+            Ok((exchange_identity(&own_identity, &mut socket).await?, socket))
         })
         .with_timeout(TRANSPORT_TIMEOUT)
         .boxed()

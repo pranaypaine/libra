@@ -4,34 +4,43 @@
 mod absint;
 pub mod ast;
 mod borrows;
-pub mod cfg;
+pub(crate) mod cfg;
+mod eliminate_locals;
+mod liveness;
 mod locals;
-pub mod translate;
+mod remove_no_ops;
+pub(crate) mod translate;
 
-use crate::shared::unique_map::UniqueMap;
-use crate::{errors::Errors, parser::ast::Var};
-use ast::*;
+use crate::{
+    errors::Errors,
+    hlir::ast::*,
+    parser::ast::{StructName, Var},
+    shared::unique_map::UniqueMap,
+};
 use cfg::*;
+use std::collections::BTreeSet;
 
-/// This is a placeholder for "optimization passes" that "fix" operations so the behave as expected
-/// The two major passes here are:
-/// - Last inferred copy becomes an inferred move
-/// - References are "released"/popped after their last usage
-///   - Might prove be a bit tricky to get exactly right as it might happen only at the statement
-///     level instead of the expression level
-pub fn refine(
-    _signature: &FunctionSignature,
-    _locals: &UniqueMap<Var, SingleType>,
-    _cfg: &mut BlockCFG,
-) {
-}
-
-pub fn verify(
+pub fn refine_inference_and_verify(
     errors: &mut Errors,
     signature: &FunctionSignature,
+    acquires: &BTreeSet<StructName>,
     locals: &UniqueMap<Var, SingleType>,
-    cfg: &BlockCFG,
+    cfg: &mut BlockCFG,
+    infinite_loop_starts: &BTreeSet<Label>,
 ) {
-    locals::verify(errors, signature, locals, cfg);
-    borrows::verify(errors, signature, locals, cfg)
+    remove_no_ops::optimize(cfg);
+
+    liveness::last_usage(errors, locals, cfg, infinite_loop_starts);
+    let locals_states = locals::verify(errors, signature, acquires, locals, cfg);
+
+    liveness::release_dead_refs(&locals_states, locals, cfg, infinite_loop_starts);
+    borrows::verify(errors, signature, acquires, locals, cfg);
+}
+
+pub fn optimize(
+    _signature: &FunctionSignature,
+    _locals: &UniqueMap<Var, SingleType>,
+    cfg: &mut BlockCFG,
+) {
+    eliminate_locals::optimize(cfg);
 }

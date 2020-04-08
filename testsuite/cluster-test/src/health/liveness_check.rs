@@ -24,8 +24,8 @@ struct LastCommitInfo {
 impl LivenessHealthCheck {
     pub fn new(cluster: &Cluster) -> Self {
         let mut last_committed = HashMap::new();
-        for instance in cluster.instances() {
-            last_committed.insert(instance.short_hash().clone(), LastCommitInfo::default());
+        for instance in cluster.validator_instances() {
+            last_committed.insert(instance.peer_name().clone(), LastCommitInfo::default());
         }
         Self { last_committed }
     }

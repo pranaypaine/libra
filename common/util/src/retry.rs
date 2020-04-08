@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{thread, time::Duration};
+use std::{future::Future, pin::Pin, thread, time::Duration};
 
 /// Given an operation retries it successfully sleeping everytime it fails
 /// If the operation succeeds before the iterator runs out, it returns success
@@ -17,6 +17,26 @@ where
             Err(err) => {
                 if let Some(delay) = iterator.next() {
                     thread::sleep(delay);
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+}
+
+pub async fn retry_async<I, O, T, E>(iterable: I, mut operation: O) -> Result<T, E>
+where
+    I: IntoIterator<Item = Duration>,
+    O: FnMut() -> Pin<Box<dyn Future<Output = Result<T, E>> + Send>>,
+{
+    let mut iterator = iterable.into_iter();
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if let Some(delay) = iterator.next() {
+                    tokio::time::delay_for(delay).await;
                 } else {
                     return Err(err);
                 }

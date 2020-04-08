@@ -4,18 +4,20 @@
 //! This module defines the abstract state for the type and memory safety analysis.
 use crate::{
     absint::{AbstractDomain, JoinResult},
-    borrow_graph::BorrowGraph,
-    nonce::Nonce,
+    signature::kind,
 };
+use borrow_graph::references::RefID;
 use mirai_annotations::{checked_postcondition, checked_precondition, checked_verify};
 use std::collections::{BTreeMap, BTreeSet};
 use vm::{
+    access::ModuleAccess,
     file_format::{
-        CompiledModule, FieldDefinitionIndex, Kind, LocalIndex, SignatureToken,
+        CompiledModule, FieldHandleIndex, FunctionDefinition, Kind, LocalIndex, SignatureToken,
         StructDefinitionIndex,
     },
-    views::{FunctionDefinitionView, ViewInternals},
 };
+
+type BorrowGraph = borrow_graph::graph::BorrowGraph<(), LabelElem>;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedAbstractValue {
@@ -23,11 +25,22 @@ pub struct TypedAbstractValue {
     pub value: AbstractValue,
 }
 
+impl TypedAbstractValue {
+    pub fn reference_to(&self, type_sig: &SignatureToken) -> bool {
+        match &self.signature {
+            SignatureToken::Reference(ref_type) | SignatureToken::MutableReference(ref_type) => {
+                ref_type.as_ref() == type_sig
+            }
+            _ => false,
+        }
+    }
+}
+
 /// AbstractValue represents a value either on the evaluation stack or
 /// in a local on a frame of the function stack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AbstractValue {
-    Reference(Nonce),
+    Reference(RefID),
     Value(Kind),
 }
 
@@ -49,15 +62,24 @@ impl AbstractValue {
     pub fn is_unrestricted_value(&self) -> bool {
         match self {
             AbstractValue::Reference(_) => false,
-            AbstractValue::Value(Kind::Unrestricted) => true,
+            AbstractValue::Value(Kind::Copyable) => true,
             AbstractValue::Value(Kind::All) | AbstractValue::Value(Kind::Resource) => false,
         }
     }
 
-    /// possibly extracts nonce from self
-    pub fn extract_nonce(&self) -> Option<Nonce> {
+    /// checks if self is a resource or all value
+    pub fn is_possibly_resource(&self) -> bool {
         match self {
-            AbstractValue::Reference(nonce) => Some(*nonce),
+            AbstractValue::Reference(_) => false,
+            AbstractValue::Value(Kind::Copyable) => false,
+            AbstractValue::Value(Kind::All) | AbstractValue::Value(Kind::Resource) => true,
+        }
+    }
+
+    /// possibly extracts id from self
+    pub fn extract_id(&self) -> Option<RefID> {
+        match self {
+            AbstractValue::Reference(id) => Some(*id),
             AbstractValue::Value(_) => None,
         }
     }
@@ -68,7 +90,7 @@ impl AbstractValue {
 pub enum LabelElem {
     Local(LocalIndex),
     Global(StructDefinitionIndex),
-    Field(FieldDefinitionIndex),
+    Field(FieldHandleIndex),
 }
 
 impl Default for LabelElem {
@@ -78,53 +100,55 @@ impl Default for LabelElem {
 }
 
 /// AbstractState is the analysis state over which abstract interpretation is performed.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AbstractState {
     locals: BTreeMap<LocalIndex, TypedAbstractValue>,
-    borrow_graph: BorrowGraph<LabelElem>,
-    frame_root: Nonce,
+    borrow_graph: BorrowGraph,
+    num_locals: usize,
     next_id: usize,
 }
 
 impl AbstractState {
     /// create a new abstract state
-    pub fn new(function_definition_view: FunctionDefinitionView<CompiledModule>) -> Self {
-        let function_signature_view = function_definition_view.signature();
+    pub fn new(module: &CompiledModule, function_definition: &FunctionDefinition) -> Self {
         let mut locals = BTreeMap::new();
         let mut borrow_graph = BorrowGraph::new();
-        for (arg_idx, arg_type_view) in function_signature_view.arg_tokens().enumerate() {
-            if arg_type_view.is_reference() {
-                let nonce = Nonce::new(arg_idx);
-                borrow_graph.add_nonce(nonce);
+
+        let func_handle = module.function_handle_at(function_definition.function);
+        let arguments = module.signature_at(func_handle.parameters);
+        for (arg_idx, argument) in arguments.0.iter().enumerate() {
+            if argument.is_reference() {
+                let id = RefID::new(arg_idx);
+                borrow_graph.new_ref(id, argument.is_mutable_reference());
                 locals.insert(
                     arg_idx as LocalIndex,
                     TypedAbstractValue {
-                        signature: arg_type_view.as_inner().clone(),
-                        value: AbstractValue::Reference(nonce),
+                        signature: argument.clone(),
+                        value: AbstractValue::Reference(id),
                     },
                 );
             } else {
-                let arg_kind = arg_type_view
-                    .kind(&function_definition_view.signature().as_inner().type_formals);
+                let arg_kind = kind(module, argument, &func_handle.type_parameters);
                 locals.insert(
                     arg_idx as LocalIndex,
                     TypedAbstractValue {
-                        signature: arg_type_view.as_inner().clone(),
+                        signature: argument.clone(),
                         value: AbstractValue::Value(arg_kind),
                     },
                 );
             }
         }
-        let frame_root = Nonce::new(function_definition_view.locals_signature().len());
-        borrow_graph.add_nonce(frame_root);
-        // nonces in [0, frame_root.inner()] are reserved for constructing canonical state
-        let next_id = frame_root.inner() + 1;
-        AbstractState {
+        let num_locals = module.signature_at(function_definition.code.locals).len();
+        // ids in [0, num_locals] are reserved for constructing canonical state
+        let next_id = num_locals + 1;
+        let mut new_state = AbstractState {
             locals,
             borrow_graph,
-            frame_root,
+            num_locals,
             next_id,
-        }
+        };
+        new_state.borrow_graph.new_ref(new_state.frame_root(), true);
+        new_state
     }
 
     /// checks if local@idx is available
@@ -147,23 +171,23 @@ impl AbstractState {
         self.locals.insert(idx, abs_type);
     }
 
-    /// checks if a local may be safely destroyed
+    /// checks if local@idx may be safely destroyed
     pub fn is_local_safe_to_destroy(&self, idx: LocalIndex) -> bool {
         match self.locals[&idx].value {
             AbstractValue::Reference(_) => true,
             AbstractValue::Value(Kind::All) | AbstractValue::Value(Kind::Resource) => false,
-            AbstractValue::Value(Kind::Unrestricted) => !self.is_local_borrowed(idx),
+            AbstractValue::Value(Kind::Copyable) => !self.is_local_borrowed(idx),
         }
     }
 
     /// checks if the stack frame of the function being analyzed can be safely destroyed.
     /// safe destruction requires that all references in locals have already been destroyed
-    /// and all values in locals are unrestricted and unborrowed.
+    /// and all values in locals are copyable and unborrowed.
     pub fn is_frame_safe_to_destroy(&self) -> bool {
         self.locals
             .values()
             .all(|x| x.value.is_unrestricted_value())
-            && !self.is_nonce_borrowed(self.frame_root)
+            && !self.is_borrowed(self.frame_root())
     }
 
     /// destroys local@idx
@@ -171,271 +195,298 @@ impl AbstractState {
         checked_precondition!(self.is_local_safe_to_destroy(idx));
         let local = self.locals.remove(&idx).unwrap();
         match local.value {
-            AbstractValue::Reference(nonce) => self.remove_nonce(nonce),
+            AbstractValue::Reference(id) => self.release(id),
             AbstractValue::Value(kind) => {
-                checked_verify!(kind == Kind::Unrestricted);
+                checked_verify!(kind == Kind::Copyable);
             }
         }
     }
 
-    /// adds new nonce to borrow graph
-    pub fn add_nonce(&mut self) -> Nonce {
-        let nonce = Nonce::new(self.next_id);
-        self.borrow_graph.add_nonce(nonce);
+    /// returns the frame root id
+    fn frame_root(&self) -> RefID {
+        RefID::new(self.num_locals)
+    }
+
+    /// adds and returns new id to borrow graph
+    pub fn add(&mut self, mut_: bool) -> RefID {
+        let id = RefID::new(self.next_id);
+        self.borrow_graph.new_ref(id, mut_);
         self.next_id += 1;
-        nonce
+        id
     }
 
-    /// removes `nonce` from borrow graph
-    pub fn remove_nonce(&mut self, nonce: Nonce) {
-        self.borrow_graph.remove_nonce(nonce);
+    /// removes `id` from borrow graph
+    pub fn release(&mut self, id: RefID) {
+        self.borrow_graph.release(id);
     }
 
-    /// checks if `nonce` is borrowed
-    pub fn is_nonce_borrowed(&self, nonce: Nonce) -> bool {
-        !self.borrow_graph.all_borrows(nonce).is_empty()
+    /// checks if `id` is borrowed
+    pub fn is_borrowed(&self, id: RefID) -> bool {
+        let (epsilon_borrows, field_borrows) = self.borrow_graph.borrowed_by(id);
+        !epsilon_borrows.is_empty() || field_borrows.values().any(|x| !x.is_empty())
     }
 
-    /// checks if a local is borrowed
+    /// checks if local@idx is borrowed
     pub fn is_local_borrowed(&self, idx: LocalIndex) -> bool {
-        !self
-            .borrow_graph
-            .consistent_borrows(self.frame_root, LabelElem::Local(idx))
-            .is_empty()
+        self.has_consistent_borrows(self.frame_root(), LabelElem::Local(idx))
     }
 
-    /// checks if a global is borrowed
+    /// checks if local@idx is mutably borrowed
+    pub fn is_local_mutably_borrowed(&self, idx: LocalIndex) -> bool {
+        self.has_mutable_consistent_borrows(self.frame_root(), LabelElem::Local(idx))
+    }
+
+    /// checks if global@idx is borrowed
     pub fn is_global_borrowed(&self, idx: StructDefinitionIndex) -> bool {
-        !self
-            .borrow_graph
-            .consistent_borrows(self.frame_root, LabelElem::Global(idx))
-            .is_empty()
+        self.has_consistent_borrows(self.frame_root(), LabelElem::Global(idx))
     }
 
-    /// checks if `nonce` is freezable
-    pub fn is_nonce_freezable(&self, nonce: Nonce) -> bool {
-        let borrows = self.borrow_graph.all_borrows(nonce);
-        self.all_nonces_immutable(borrows)
+    /// checks if `id` is freezable
+    pub fn is_freezable(&self, id: RefID) -> bool {
+        let (epsilon_borrows, field_borrows) = self.borrow_graph.borrowed_by(id);
+        self.all_immutable(&epsilon_borrows)
+            && field_borrows.values().all(|x| self.all_immutable(x))
     }
 
-    /// update self to reflect a borrow of a value global@idx by new_nonce
-    pub fn borrow_global_value(&mut self, mut_: bool, idx: StructDefinitionIndex) -> Option<Nonce> {
+    /// if `id` is freezable, return the frozen version of `id`
+    pub fn freeze_ref(&mut self, id: RefID) -> Option<RefID> {
+        checked_precondition!(self.borrow_graph.is_mutable(id));
+        if self.is_freezable(id) {
+            let new_id = self.add(false);
+            self.borrow_graph.add_strong_borrow((), id, new_id);
+            self.release(id);
+            Some(new_id)
+        } else {
+            None
+        }
+    }
+
+    /// update self to reflect a borrow of global@idx by a fresh id that is returned
+    pub fn borrow_global_value(&mut self, mut_: bool, idx: StructDefinitionIndex) -> Option<RefID> {
         if mut_ {
             if self.is_global_borrowed(idx) {
                 return None;
             }
-        } else {
-            let borrowed_nonces = self
-                .borrow_graph
-                .consistent_borrows(self.frame_root, LabelElem::Global(idx));
-            if !self.all_nonces_immutable(borrowed_nonces) {
-                return None;
-            }
+        } else if self.has_mutable_consistent_borrows(self.frame_root(), LabelElem::Global(idx)) {
+            return None;
         }
-        let new_nonce = self.add_nonce();
-        self.borrow_graph
-            .add_weak_edge(self.frame_root, vec![LabelElem::Global(idx)], new_nonce);
-        Some(new_nonce)
+        let new_id = self.add(mut_);
+        self.borrow_graph.add_weak_field_borrow(
+            (),
+            self.frame_root(),
+            LabelElem::Global(idx),
+            new_id,
+        );
+        Some(new_id)
     }
 
-    /// update self to reflect a borrow of field@idx from nonce by new_nonce
-    pub fn borrow_field_from_nonce(
+    /// update self to reflect a borrow of field@idx from operand.value by a fresh id that is returned
+    pub fn borrow_field(
         &mut self,
         operand: &TypedAbstractValue,
         mut_: bool,
-        idx: FieldDefinitionIndex,
-    ) -> Option<Nonce> {
-        let nonce = operand.value.extract_nonce().unwrap();
+        idx: FieldHandleIndex,
+    ) -> Option<RefID> {
+        let id = operand.value.extract_id().unwrap();
         if mut_ {
-            if !self.borrow_graph.nil_borrows(nonce).is_empty() {
+            if self.has_epsilon_borrows(id) {
                 return None;
             }
-        } else if operand.signature.is_mutable_reference() {
-            let borrowed_nonces = self
-                .borrow_graph
-                .consistent_borrows(nonce, LabelElem::Field(idx));
-            if !self.all_nonces_immutable(borrowed_nonces) {
-                return None;
-            }
+        } else if operand.signature.is_mutable_reference()
+            && self.has_mutable_consistent_borrows(id, LabelElem::Field(idx))
+        {
+            return None;
         }
-        let new_nonce = self.add_nonce();
+        let new_id = self.add(mut_);
         self.borrow_graph
-            .add_strong_edge(nonce, vec![LabelElem::Field(idx)], new_nonce);
-        Some(new_nonce)
+            .add_strong_field_borrow((), id, LabelElem::Field(idx), new_id);
+        Some(new_id)
     }
 
-    /// update self to reflect a borrow of a value local@idx by new_nonce
-    pub fn borrow_local_value(&mut self, mut_: bool, idx: LocalIndex) -> Option<Nonce> {
+    /// update self to reflect a borrow of local@idx (which must be a value) by a fresh id that is returned
+    pub fn borrow_local_value(&mut self, mut_: bool, idx: LocalIndex) -> Option<RefID> {
         checked_precondition!(self.locals[&idx].value.is_value());
         if !mut_ {
-            // nothing to check in case borrow is mutable since the frame cannot have a NIL outgoing edge
-            let borrowed_nonces = self
-                .borrow_graph
-                .consistent_borrows(self.frame_root, LabelElem::Local(idx));
-            if !self.all_nonces_immutable(borrowed_nonces) {
+            // nothing to check in case borrow is mutable since the frame cannot have an epsilon outgoing edge
+            if self.has_mutable_consistent_borrows(self.frame_root(), LabelElem::Local(idx)) {
                 return None;
             }
         }
-        let new_nonce = self.add_nonce();
-        self.borrow_graph
-            .add_strong_edge(self.frame_root, vec![LabelElem::Local(idx)], new_nonce);
-        Some(new_nonce)
-    }
-
-    /// update self to reflect a borrow of a reference local@idx by new_nonce
-    pub fn borrow_from_local_reference(&mut self, idx: LocalIndex) -> Nonce {
-        checked_precondition!(self.locals[&idx].value.is_reference());
-        let new_nonce = self.add_nonce();
-        self.borrow_graph.add_strong_edge(
-            self.locals[&idx].value.extract_nonce().unwrap(),
-            vec![],
-            new_nonce,
+        let new_id = self.add(mut_);
+        self.borrow_graph.add_strong_field_borrow(
+            (),
+            self.frame_root(),
+            LabelElem::Local(idx),
+            new_id,
         );
-        new_nonce
+        Some(new_id)
     }
 
-    /// update self to reflect a borrow from each nonce in to_borrow_from by new_nonce
-    pub fn borrow_from_nonces(&mut self, to_borrow_from: &BTreeSet<Nonce>) -> Nonce {
-        let new_nonce = self.add_nonce();
-        for nonce in to_borrow_from {
-            self.borrow_graph.add_weak_edge(*nonce, vec![], new_nonce);
+    /// update self to reflect a borrow of local@idx (which must be a reference) by a fresh id that is returned
+    pub fn borrow_local_reference(&mut self, idx: LocalIndex, mut_: bool) -> RefID {
+        checked_precondition!(self.locals[&idx].value.is_reference());
+        let new_id = self.add(mut_);
+        self.borrow_graph.add_strong_borrow(
+            (),
+            self.locals[&idx].value.extract_id().unwrap(),
+            new_id,
+        );
+        new_id
+    }
+
+    /// update self to reflect a borrow from each id in to_borrow_from by a fresh id that is returned
+    pub fn borrow_from(&mut self, to_borrow_from: &BTreeSet<RefID>, mut_: bool) -> RefID {
+        let new_id = self.add(mut_);
+        for id in to_borrow_from {
+            self.borrow_graph.add_weak_borrow((), *id, new_id);
         }
-        new_nonce
+        new_id
     }
 
     /// returns the canonical representation of self
     pub fn construct_canonical_state(&self) -> Self {
-        let mut new_locals = BTreeMap::new();
-        let mut nonce_map = BTreeMap::new();
-        for (idx, abs_type) in &self.locals {
-            if let AbstractValue::Reference(nonce) = abs_type.value {
-                let new_nonce = Nonce::new(*idx as usize);
-                new_locals.insert(
-                    *idx,
-                    TypedAbstractValue {
-                        signature: abs_type.signature.clone(),
-                        value: AbstractValue::Reference(new_nonce),
-                    },
-                );
-                nonce_map.insert(nonce, new_nonce);
-            } else {
-                new_locals.insert(*idx, abs_type.clone());
-            }
-        }
-        nonce_map.insert(self.frame_root, self.frame_root);
+        let mut id_map = BTreeMap::new();
+        id_map.insert(self.frame_root(), self.frame_root());
+        let locals = self
+            .locals
+            .iter()
+            .map(|(idx, abs)| {
+                let new_abs = match &abs.value {
+                    AbstractValue::Reference(id) => {
+                        let new_id = RefID::new(*idx as usize);
+                        id_map.insert(*id, new_id);
+                        TypedAbstractValue {
+                            signature: abs.signature.clone(),
+                            value: AbstractValue::Reference(new_id),
+                        }
+                    }
+                    _ => abs.clone(),
+                };
+                (*idx, new_abs)
+            })
+            .collect::<BTreeMap<_, _>>();
+        checked_verify!(self.locals.len() == locals.len());
+        let mut borrow_graph = self.borrow_graph.clone();
+        borrow_graph.remap_refs(&id_map);
         let canonical_state = AbstractState {
-            locals: new_locals,
-            borrow_graph: self.borrow_graph.rename_nonces(nonce_map),
-            frame_root: self.frame_root,
-            next_id: self.frame_root.inner() + 1,
+            locals,
+            borrow_graph,
+            num_locals: self.num_locals,
+            next_id: self.num_locals + 1,
         };
         checked_postcondition!(canonical_state.is_canonical());
         canonical_state
     }
 
-    fn all_nonces_immutable(&self, borrows: BTreeSet<Nonce>) -> bool {
-        !self.locals.values().any(|abs_type| {
-            abs_type.signature.is_mutable_reference()
-                && borrows.contains(&abs_type.value.extract_nonce().unwrap())
-        })
+    fn all_immutable(&self, borrows: &BTreeMap<RefID, ()>) -> bool {
+        !borrows.keys().any(|x| self.borrow_graph.is_mutable(*x))
     }
 
     fn is_canonical(&self) -> bool {
-        self.locals.iter().all(|(x, y)| {
-            !y.value.is_reference() || Nonce::new(*x as usize) == y.value.extract_nonce().unwrap()
-        })
+        self.num_locals + 1 == self.next_id
+            && self.locals.iter().all(|(x, y)| {
+                !y.value.is_reference() || RefID::new(*x as usize) == y.value.extract_id().unwrap()
+            })
     }
 
-    fn borrowed_value_unavailable(state1: &AbstractState, state2: &AbstractState) -> bool {
-        state1.locals.keys().any(|idx| {
-            state1.locals[idx].value.is_value()
-                && state1.is_local_borrowed(*idx)
-                && !state2.locals.contains_key(idx)
-        })
+    fn iter_locals(&self) -> impl Iterator<Item = LocalIndex> {
+        0..self.num_locals as LocalIndex
     }
 
-    fn split_locals(
-        locals: &BTreeMap<LocalIndex, TypedAbstractValue>,
-        values: &mut BTreeMap<LocalIndex, Kind>,
-        references: &mut BTreeMap<LocalIndex, Nonce>,
-    ) {
-        for (idx, abs_type) in locals {
-            match abs_type.value {
-                AbstractValue::Reference(nonce) => {
-                    references.insert(idx.clone(), nonce);
+    fn has_epsilon_borrows(&self, id: RefID) -> bool {
+        let (epsilon_borrows, _) = self.borrow_graph.borrowed_by(id);
+        !epsilon_borrows.is_empty()
+    }
+
+    fn has_consistent_borrows(&self, id: RefID, label: LabelElem) -> bool {
+        let (epsilon_borrows, field_borrows) = self.borrow_graph.borrowed_by(id);
+        !epsilon_borrows.is_empty()
+            || (match field_borrows.get(&label) {
+                Some(x) => !x.is_empty(),
+                None => false,
+            })
+    }
+
+    fn has_mutable_consistent_borrows(&self, id: RefID, label: LabelElem) -> bool {
+        let (epsilon_borrows, field_borrows) = self.borrow_graph.borrowed_by(id);
+        !self.all_immutable(&epsilon_borrows)
+            || (match field_borrows.get(&label) {
+                Some(x) => !self.all_immutable(x),
+                None => false,
+            })
+    }
+
+    /// returns `Some` of the self joined with other,
+    /// returns `None` if there is a join error
+    pub fn join_(&self, other: &Self) -> Option<Self> {
+        checked_precondition!(self.is_canonical() && other.is_canonical());
+        checked_precondition!(self.next_id == other.next_id);
+        checked_precondition!(self.num_locals == other.num_locals);
+        let mut locals = BTreeMap::new();
+        let mut self_graph = self.borrow_graph.clone();
+        let mut other_graph = other.borrow_graph.clone();
+        for idx in self.iter_locals() {
+            let self_value = self.locals.get(&idx);
+            let other_value = other.locals.get(&idx);
+            match (self_value, other_value) {
+                // Unavailable on both sides, nothing to add
+                (None, None) => (),
+
+                // Join error, a resource is available along one path but not the other
+                (None, Some(v)) | (Some(v), None) if v.value.is_possibly_resource() => return None,
+
+                // The local has a copyable value on one side but not the other, nothing to add
+                (Some(v), None) => {
+                    // A reference exists on one side, but not the other. Release
+                    if let AbstractValue::Reference(id) = &v.value {
+                        self_graph.release(*id);
+                    }
                 }
-                AbstractValue::Value(kind) => {
-                    values.insert(idx.clone(), kind);
+                (None, Some(v)) => {
+                    // A reference exists on one side, but not the other. Release
+                    if let AbstractValue::Reference(id) = &v.value {
+                        other_graph.release(*id);
+                    }
+                }
+
+                // The local has a value on each side, add it to the state
+                (Some(v1), Some(v2)) => {
+                    checked_verify!(v1 == v2);
+                    checked_verify!(!locals.contains_key(&idx));
+                    locals.insert(idx, v1.clone());
                 }
             }
         }
+
+        let borrow_graph = self_graph.join(&other_graph);
+        let next_id = self.next_id;
+        let num_locals = self.num_locals;
+
+        Some(Self {
+            locals,
+            borrow_graph,
+            next_id,
+            num_locals,
+        })
     }
 }
 
 impl AbstractDomain for AbstractState {
     /// attempts to join state to self and returns the result
     fn join(&mut self, state: &AbstractState) -> JoinResult {
-        checked_precondition!(self.is_canonical() && state.is_canonical());
-        // A join failure occurs in each of the following situations:
-        // - a reference or resource is available along one path but not the other
-        // - a value is borrowed along one path but unavailable along the other
-        if self
-            .locals
-            .keys()
-            .filter(|idx| !self.locals[idx].value.is_unrestricted_value())
-            .collect::<BTreeSet<_>>()
-            != state
-                .locals
-                .keys()
-                .filter(|idx| !state.locals[idx].value.is_unrestricted_value())
-                .collect::<BTreeSet<_>>()
-        {
-            return JoinResult::Error;
-        }
-        if Self::borrowed_value_unavailable(self, state)
-            || Self::borrowed_value_unavailable(state, self)
-        {
-            return JoinResult::Error;
-        }
-
-        let mut values1 = BTreeMap::new();
-        let mut references1 = BTreeMap::new();
-        Self::split_locals(&self.locals, &mut values1, &mut references1);
-        let mut values2 = BTreeMap::new();
-        let mut references2 = BTreeMap::new();
-        Self::split_locals(&state.locals, &mut values2, &mut references2);
-        checked_verify!(references1 == references2);
-
-        let mut locals = BTreeMap::new();
-        for (idx, nonce) in &references1 {
-            locals.insert(
-                idx.clone(),
-                TypedAbstractValue {
-                    signature: self.locals[idx].signature.clone(),
-                    value: AbstractValue::Reference(*nonce),
-                },
-            );
-        }
-        for (idx, kind1) in &values1 {
-            if let Some(kind2) = values2.get(idx) {
-                checked_verify!(kind1 == kind2);
-                locals.insert(
-                    idx.clone(),
-                    TypedAbstractValue {
-                        signature: self.locals[idx].signature.clone(),
-                        value: AbstractValue::Value(*kind1),
-                    },
-                );
-            }
-        }
-
-        let locals_unchanged = self.locals.keys().all(|idx| locals.contains_key(idx));
-        let borrow_graph_unchanged = self.borrow_graph.abstracts(&state.borrow_graph);
+        let joined = match Self::join_(self, state) {
+            None => return JoinResult::Error,
+            Some(joined) => joined,
+        };
+        checked_verify!(self.num_locals == joined.num_locals);
+        let locals_unchanged = self
+            .iter_locals()
+            .all(|idx| self.locals.get(&idx) == joined.locals.get(&idx));
+        let borrow_graph_unchanged = self.borrow_graph.leq(&joined.borrow_graph);
         if locals_unchanged && borrow_graph_unchanged {
             JoinResult::Unchanged
         } else {
-            self.locals = locals;
-            self.borrow_graph.join(&state.borrow_graph);
+            *self = joined;
             JoinResult::Changed
         }
     }

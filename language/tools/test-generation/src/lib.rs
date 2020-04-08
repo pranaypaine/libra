@@ -15,26 +15,29 @@ pub mod transitions;
 #[macro_use]
 extern crate mirai_annotations;
 
-#[macro_use]
-extern crate log;
-extern crate env_logger;
 use crate::config::{Args, EXECUTE_UNVERIFIED_MODULE, RUN_ON_VM};
 use bytecode_generator::BytecodeGenerator;
 use bytecode_verifier::VerifiedModule;
-use cost_synthesis::module_generator::ModuleBuilder;
+use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
+use getrandom::getrandom;
 use language_e2e_tests::executor::FakeExecutor;
-use libra_types::{
-    account_address::AccountAddress, byte_array::ByteArray, transaction::TransactionArgument,
-};
-use std::{fs, io::Write, panic};
+use libra_logger::{debug, error, info};
+use libra_state_view::StateView;
+use libra_types::{account_address::AccountAddress, vm_error::StatusCode};
+use libra_vm::LibraVM;
+use move_vm_types::{loaded_data::types::Type, values::Value};
+use rand::{rngs::StdRng, Rng, SeedableRng};
+use std::{fs, io::Write, panic, thread};
+use utils::module_generation::generate_module;
 use vm::{
     access::ModuleAccess,
+    errors::VMResult,
     file_format::{
-        Bytecode, CompiledModule, CompiledModuleMut, FunctionDefinitionIndex, FunctionSignature,
-        SignatureToken, StructDefinitionIndex,
+        CompiledModule, CompiledModuleMut, FunctionDefinitionIndex, Kind, SignatureToken,
+        StructHandleIndex,
     },
+    transaction_metadata::TransactionMetadata,
 };
-use vm_runtime::execute_function_in_module;
 
 /// This function calls the Bytecode verifier to test it
 fn run_verifier(module: CompiledModule) -> Result<VerifiedModule, String> {
@@ -46,44 +49,87 @@ fn run_verifier(module: CompiledModule) -> Result<VerifiedModule, String> {
 }
 
 /// This function runs a verified module in the VM runtime
-fn run_vm(module: VerifiedModule) -> Result<(), String> {
+fn run_vm(module: VerifiedModule) -> VMResult<()> {
+    // By convention the 0'th index function definition is the entrypoint to the module (i.e. that
+    // will contain only simply-typed arguments).
     let entry_idx = FunctionDefinitionIndex::new(0);
     let function_signature = {
         let handle = module.function_def_at(entry_idx).function;
-        let sig_idx = module.function_handle_at(handle).signature;
-        module.function_signature_at(sig_idx).clone()
+        let sig_idx = module.function_handle_at(handle).parameters;
+        module.signature_at(sig_idx).clone()
     };
-
-    let main_args: Vec<TransactionArgument> = function_signature
-        .arg_types
+    let main_args: Vec<Value> = function_signature
+        .0
         .iter()
         .map(|sig_tok| match sig_tok {
-            SignatureToken::Address => TransactionArgument::Address(AccountAddress::new([0; 32])),
-            SignatureToken::U64 => TransactionArgument::U64(0),
-            SignatureToken::Bool => TransactionArgument::Bool(true),
-            SignatureToken::String => TransactionArgument::String("".into()),
-            SignatureToken::ByteArray => TransactionArgument::ByteArray(ByteArray::new(vec![])),
+            SignatureToken::Address => Value::address(AccountAddress::DEFAULT),
+            SignatureToken::U64 => Value::u64(0),
+            SignatureToken::Bool => Value::bool(true),
+            SignatureToken::Vector(inner_tok) if **inner_tok == SignatureToken::U8 => {
+                Value::vector_u8(vec![])
+            }
             _ => unimplemented!("Unsupported argument type: {:#?}", sig_tok),
         })
         .collect();
 
     let executor = FakeExecutor::from_genesis_file();
-    match execute_function_in_module(executor.get_state_view(), module, entry_idx, main_args) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("Runtime error: {:?}", e)),
+    execute_function_in_module(
+        executor.get_state_view(),
+        module,
+        entry_idx,
+        vec![],
+        main_args,
+    )
+}
+
+/// Execute the first function in a module
+fn execute_function_in_module(
+    state_view: &dyn StateView,
+    module: VerifiedModule,
+    idx: FunctionDefinitionIndex,
+    ty_args: Vec<Type>,
+    args: Vec<Value>,
+) -> VMResult<()> {
+    let module_id = module.as_inner().self_id();
+    let entry_name = {
+        let entry_func_idx = module.function_def_at(idx).function;
+        let entry_name_idx = module.function_handle_at(entry_func_idx).name;
+        module.identifier_at(entry_name_idx)
+    };
+    {
+        let mut libra_vm = LibraVM::new();
+        libra_vm.load_configs(state_view);
+
+        let internals = libra_vm.internals();
+        let move_vm = internals.move_vm();
+        move_vm.cache_module(module.clone());
+
+        let gas_schedule = internals.gas_schedule()?;
+        let txn_data = TransactionMetadata::default();
+        internals.with_txn_context(&txn_data, state_view, |mut txn_context| {
+            move_vm.execute_function(
+                &module_id,
+                &entry_name,
+                gas_schedule,
+                &mut txn_context,
+                &txn_data,
+                ty_args,
+                args,
+            )
+        })
     }
 }
 
 /// Serialize a module to `path` if `output_path` is `Some(path)`. If `output_path` is `None`
 /// print the module out as debug output.
-fn output_error_case(module: CompiledModule, output_path: Option<String>, iteration: u64) {
+fn output_error_case(module: CompiledModule, output_path: Option<String>, case_id: u64, tid: u64) {
     match output_path {
         Some(path) => {
             let mut out = vec![];
             module
                 .serialize(&mut out)
                 .expect("Unable to serialize module");
-            let output_file = format!("{}/case{}.module", path, iteration);
+            let output_file = format!("{}/case{}_{}.module", path, tid, case_id);
             let mut f = fs::File::create(&output_file)
                 .unwrap_or_else(|err| panic!("Unable to open output file {}: {}", &path, err));
             f.write_all(&out)
@@ -95,41 +141,124 @@ fn output_error_case(module: CompiledModule, output_path: Option<String>, iterat
     }
 }
 
-/// Generate a sequence of bytecode instructions such that
-/// - The arguments 'arguments' are used
-/// - The return type 'signature' is reached
-/// - The number of instructions generated is between 'target_min' and 'target_max'
-pub fn generate_bytecode(
-    arguments: &[SignatureToken],
-    signature: &FunctionSignature,
-    acquires_global_resources: &[StructDefinitionIndex],
-    module: CompiledModuleMut,
-) -> Vec<Bytecode> {
-    let mut bytecode_generator = BytecodeGenerator::new(None);
-    bytecode_generator.generate(arguments, signature, acquires_global_resources, module)
+fn seed(seed: Option<String>) -> [u8; 32] {
+    let mut array = [0u8; 32];
+    match seed {
+        Some(string) => {
+            let vec = hex::decode(string).unwrap();
+            if vec.len() != 32 {
+                panic!("Invalid seed supplied, the length must be 32.");
+            }
+            for (i, byte) in vec.into_iter().enumerate() {
+                array[i] = byte;
+            }
+        }
+        None => {
+            getrandom(&mut array).unwrap();
+        }
+    };
+    array
 }
 
-/// Run generate_bytecode for 'iterations' iterations and test each generated module
-/// on the bytecode verifier.
-pub fn run_generation(args: Args) {
-    env_logger::init();
-    let iterations = args.num_iterations;
-    let mut verified_programs: u64 = 0;
-    let mut executed_programs: u64 = 0;
-    for i in 0..iterations {
-        let module =
-            ModuleBuilder::new(1, Some(Box::new(generate_bytecode))).materialize_unverified();
-        debug!("Running on verifier...");
+#[derive(Debug, Clone, PartialEq)]
+pub enum Status {
+    VerificationFailure,
+    ExecutionFailure,
+    Valid,
+}
+
+fn bytecode_module(rng: &mut StdRng, module: CompiledModuleMut) -> CompiledModuleMut {
+    let mut generated_module = BytecodeGenerator::new(rng).generate_module(module.clone());
+    // Module generation can retry under certain circumstances
+    while generated_module.is_none() {
+        generated_module = BytecodeGenerator::new(rng).generate_module(module.clone());
+    }
+    generated_module.unwrap()
+}
+
+pub fn module_frame_generation(
+    num_iters: Option<u64>,
+    seed: [u8; 32],
+    sender: Sender<CompiledModuleMut>,
+    stats: Receiver<Status>,
+) {
+    let mut verification_failures: u128 = 0;
+    let mut execution_failures: u128 = 0;
+    let mut generated: u128 = 1;
+
+    let generation_options = config::module_generation_settings();
+    let mut rng = StdRng::from_seed(seed);
+    let mut module = generate_module(&mut rng, generation_options.clone()).into_inner();
+    // Either get the number of iterations provided by the user, or iterate "infinitely"--up to
+    // u128::MAX number of times.
+    let iters = num_iters
+        .map(|x| x as u128)
+        .unwrap_or_else(|| std::u128::MAX);
+
+    while generated < iters && sender.send(module).is_ok() {
+        module = generate_module(&mut rng, generation_options.clone()).into_inner();
+        generated += 1;
+        while let Ok(stat) = stats.try_recv() {
+            match stat {
+                Status::VerificationFailure => verification_failures += 1,
+                Status::ExecutionFailure => execution_failures += 1,
+                _ => (),
+            };
+        }
+
+        if generated > 0 && generated % 100 == 0 {
+            info!(
+                "Generated: {} Verified: {} Executed: {}",
+                generated,
+                (generated - verification_failures),
+                (generated - execution_failures)
+            );
+        }
+    }
+
+    // Drop the sender channel to signal to the consumers that they should expect no more modules,
+    // and should finish up.
+    drop(sender);
+
+    // Gather final stats from the consumers.
+    while let Ok(stat) = stats.recv() {
+        match stat {
+            Status::VerificationFailure => verification_failures += 1,
+            Status::ExecutionFailure => execution_failures += 1,
+            _ => (),
+        };
+    }
+    info!(
+        "Final stats: Generated: {} Verified: {} Executed: {}",
+        generated,
+        (generated - verification_failures),
+        (generated - execution_failures)
+    );
+}
+
+pub fn bytecode_generation(
+    output_path: Option<String>,
+    tid: u64,
+    mut rng: StdRng,
+    receiver: Receiver<CompiledModuleMut>,
+    stats: Sender<Status>,
+) {
+    while let Ok(module) = receiver.recv() {
+        let mut status = Status::VerificationFailure;
+        debug!("Generating module");
+        let module = bytecode_module(&mut rng, module);
+
+        debug!("Done...Running module on verifier...");
+        let module = module.freeze().expect("generated module failed to freeze.");
         let verified_module = match run_verifier(module.clone()) {
             Ok(verified_module) => {
-                // We cannot execute more than u64::max_value() iterations.
-                verify!(verified_programs < u64::max_value());
-                verified_programs += 1;
+                status = Status::ExecutionFailure;
                 Some(verified_module)
             }
             Err(e) => {
                 error!("{}", e);
-                output_error_case(module.clone(), args.output_path.clone(), i);
+                let uid = rng.gen::<u64>();
+                output_error_case(module.clone(), output_path.clone(), uid, tid);
                 if EXECUTE_UNVERIFIED_MODULE {
                     Some(VerifiedModule::bypass_verifier_DANGEROUS_FOR_TESTING_ONLY(
                         module.clone(),
@@ -139,42 +268,178 @@ pub fn run_generation(args: Args) {
                 }
             }
         };
+
         if let Some(verified_module) = verified_module {
             if RUN_ON_VM {
-                debug!("Running on VM...");
+                debug!("Done...Running module on VM...");
                 let execution_result = panic::catch_unwind(|| run_vm(verified_module));
                 match execution_result {
-                    Ok(execution_result) => {
-                        match execution_result {
-                            Ok(_) => {
-                                // We cannot execute more than u64::max_value() iterations.
-                                verify!(executed_programs < u64::max_value());
-                                executed_programs += 1
-                            }
-                            Err(e) => {
-                                // TODO: Uncomment this to allow saving of modules that fail
-                                // the VM runtime.
-                                // output_error_case(module.clone(), args.output_path.clone(), i);
-                                error!("{}", e)
-                            }
+                    Ok(execution_result) => match execution_result {
+                        Ok(_) => {
+                            status = Status::Valid;
                         }
-                    }
+                        Err(e) => match e.major_status {
+                            StatusCode::ARITHMETIC_ERROR | StatusCode::OUT_OF_GAS => {
+                                status = Status::Valid;
+                            }
+                            _ => {
+                                error!("{}", e);
+                                let uid = rng.gen::<u64>();
+                                output_error_case(module.clone(), output_path.clone(), uid, tid);
+                            }
+                        },
+                    },
                     Err(_) => {
                         // Save modules that cause the VM runtime to panic
-                        output_error_case(module.clone(), args.output_path.clone(), i);
+                        let uid = rng.gen::<u64>();
+                        output_error_case(module.clone(), output_path.clone(), uid, tid);
                     }
                 }
+            } else {
+                status = Status::Valid;
             }
         };
-        if iterations > 10 && i % (iterations / 10) == 0 {
-            info!("Iteration: {} / {}", i, iterations);
-        }
+        stats.send(status).unwrap();
     }
 
-    info!(
-        "Total programs: {}, Percent valid: {:.2}, Percent executed {:.2}",
-        iterations,
-        (verified_programs as f64) / (iterations as f64) * 100.0,
-        (executed_programs as f64) / (iterations as f64) * 100.0,
+    drop(stats);
+}
+
+/// Run generate_bytecode for the range passed in and test each generated module
+/// on the bytecode verifier.
+pub fn run_generation(args: Args) {
+    let num_threads = if let Some(num_threads) = args.num_threads {
+        num_threads as usize
+    } else {
+        num_cpus::get()
+    };
+    assert!(
+        num_threads > 0,
+        "Number of worker threads must be greater than 0"
     );
+
+    let (sender, receiver) = bounded(num_threads);
+    let (stats_sender, stats_reciever) = unbounded();
+    let seed = seed(args.seed);
+
+    let mut threads = Vec::new();
+    for tid in 0..num_threads {
+        let receiver = receiver.clone();
+        let stats_sender = stats_sender.clone();
+        let rng = StdRng::from_seed(seed);
+        let output_path = args.output_path.clone();
+        threads.push(thread::spawn(move || {
+            bytecode_generation(output_path, tid as u64, rng, receiver, stats_sender)
+        }));
+    }
+
+    // Need to drop this channel otherwise we'll get infinite blocking since the other channels are
+    // cloned; this one will remain open unless we close it and other threads are going to block
+    // waiting for more stats.
+    drop(stats_sender);
+
+    let num_iters = args.num_iterations;
+    threads.push(thread::spawn(move || {
+        module_frame_generation(num_iters, seed, sender, stats_reciever)
+    }));
+
+    for thread in threads {
+        thread.join().unwrap();
+    }
+}
+
+pub(crate) fn substitute(token: &SignatureToken, tys: &[SignatureToken]) -> SignatureToken {
+    use SignatureToken::*;
+
+    match token {
+        Bool => Bool,
+        U8 => U8,
+        U64 => U64,
+        U128 => U128,
+        Address => Address,
+        Vector(ty) => Vector(Box::new(substitute(ty, tys))),
+        Struct(idx) => Struct(*idx),
+        StructInstantiation(idx, type_params) => StructInstantiation(
+            *idx,
+            type_params.iter().map(|ty| substitute(ty, tys)).collect(),
+        ),
+        Reference(ty) => Reference(Box::new(substitute(ty, tys))),
+        MutableReference(ty) => MutableReference(Box::new(substitute(ty, tys))),
+        TypeParameter(idx) => {
+            // Assume that the caller has previously parsed and verified the structure of the
+            // file and that this guarantees that type parameter indices are always in bounds.
+            assume!((*idx as usize) < tys.len());
+            tys[*idx as usize].clone()
+        }
+    }
+}
+
+pub fn kind(module: &impl ModuleAccess, ty: &SignatureToken, constraints: &[Kind]) -> Kind {
+    use SignatureToken::*;
+
+    match ty {
+        // The primitive types & references have kind unrestricted.
+        Bool | U8 | U64 | U128 | Address | Reference(_) | MutableReference(_) => Kind::Copyable,
+        TypeParameter(idx) => constraints[*idx as usize],
+        Vector(ty) => kind(module, ty, constraints),
+        Struct(idx) => {
+            let sh = module.struct_handle_at(*idx);
+            if sh.is_nominal_resource {
+                Kind::Resource
+            } else {
+                Kind::Copyable
+            }
+        }
+        StructInstantiation(idx, type_args) => {
+            let sh = module.struct_handle_at(*idx);
+            if sh.is_nominal_resource {
+                return Kind::Resource;
+            }
+            // Gather the kinds of the type actuals.
+            let kinds = type_args
+                .iter()
+                .map(|ty| kind(module, ty, constraints))
+                .collect::<Vec<_>>();
+            // Derive the kind of the struct.
+            //   - If any of the type actuals is `all`, then the struct is `all`.
+            //     - `all` means some part of the type can be either `resource` or
+            //       `unrestricted`.
+            //     - Therefore it is also impossible to determine the kind of the type as a
+            //       whole, and thus `all`.
+            //   - If none of the type actuals is `all`, then the struct is a resource if
+            //     and only if one of the type actuals is `resource`.
+            kinds.iter().cloned().fold(Kind::Copyable, Kind::join)
+        }
+    }
+}
+
+pub(crate) fn get_struct_handle_from_reference(
+    reference_signature: &SignatureToken,
+) -> Option<StructHandleIndex> {
+    match reference_signature {
+        SignatureToken::Reference(signature) => match **signature {
+            SignatureToken::StructInstantiation(idx, _) | SignatureToken::Struct(idx) => Some(idx),
+            _ => None,
+        },
+        SignatureToken::MutableReference(signature) => match **signature {
+            SignatureToken::StructInstantiation(idx, _) | SignatureToken::Struct(idx) => Some(idx),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+pub(crate) fn get_type_actuals_from_reference(
+    token: &SignatureToken,
+) -> Option<Vec<SignatureToken>> {
+    use SignatureToken::*;
+
+    match token {
+        Reference(box_) | MutableReference(box_) => match &**box_ {
+            StructInstantiation(_, tys) => Some(tys.clone()),
+            Struct(_) => Some(vec![]),
+            _ => None,
+        },
+        _ => None,
+    }
 }

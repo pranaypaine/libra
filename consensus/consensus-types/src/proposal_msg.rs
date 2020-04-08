@@ -6,10 +6,9 @@ use crate::{
     common::{Author, Payload, Round},
     sync_info::SyncInfo,
 };
-use failure::prelude::*;
-use libra_types::crypto_proxies::ValidatorVerifier;
+use anyhow::{ensure, format_err, Context, Result};
+use libra_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
-use std::convert::{TryFrom, TryInto};
 use std::fmt;
 
 /// ProposalMsg contains the required information for the proposer election protocol to make its
@@ -21,59 +20,6 @@ pub struct ProposalMsg<T> {
     sync_info: SyncInfo,
 }
 
-/// A ProposalMsg is only accessible after verifying the signatures of a ProposalUncheckedSignatures
-/// via the `validate_signatures` function.
-pub struct ProposalUncheckedSignatures<T>(ProposalMsg<T>);
-
-impl<T: Payload> TryFrom<network::proto::Proposal> for ProposalUncheckedSignatures<T> {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::Proposal) -> failure::Result<Self> {
-        Ok(ProposalUncheckedSignatures(lcs::from_bytes(&proto.bytes)?))
-    }
-}
-
-impl<T: Payload> TryFrom<network::proto::ConsensusMsg> for ProposalUncheckedSignatures<T> {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::ConsensusMsg) -> failure::Result<Self> {
-        match proto.message {
-            Some(network::proto::ConsensusMsg_oneof::Proposal(proposal)) => proposal.try_into(),
-            _ => bail!("Missing proposal"),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "fuzzing"))]
-impl<T: Payload> From<ProposalUncheckedSignatures<T>> for ProposalMsg<T> {
-    fn from(proposal: ProposalUncheckedSignatures<T>) -> Self {
-        proposal.0
-    }
-}
-
-impl<T: Payload> ProposalUncheckedSignatures<T> {
-    /// Validates the signatures of the proposal. This includes the leader's signature over the
-    /// block and the QC, the timeout certificate signatures.
-    pub fn validate_signatures(self, validator: &ValidatorVerifier) -> Result<ProposalMsg<T>> {
-        // verify block leader's signature and QC
-        self.0
-            .proposal
-            .validate_signatures(validator)
-            .map_err(|e| format_err!("{:?}", e))?;
-        // if there is a timeout certificate, verify its signatures
-        if let Some(tc) = self.0.sync_info.highest_timeout_certificate() {
-            tc.verify(validator).map_err(|e| format_err!("{:?}", e))?;
-        }
-        // Note that we postpone the verification of SyncInfo until it's being used.
-        // return proposal
-        Ok(self.0)
-    }
-
-    pub fn epoch(&self) -> u64 {
-        self.0.proposal.epoch()
-    }
-}
-
 impl<T: Payload> ProposalMsg<T> {
     /// Creates a new proposal.
     pub fn new(proposal: Block<T>, sync_info: SyncInfo) -> Self {
@@ -83,8 +29,12 @@ impl<T: Payload> ProposalMsg<T> {
         }
     }
 
+    pub fn epoch(&self) -> u64 {
+        self.proposal.epoch()
+    }
+
     /// Verifies that the ProposalMsg is well-formed.
-    pub fn verify_well_formed(self) -> Result<Self> {
+    pub fn verify_well_formed(&self) -> Result<()> {
         ensure!(
             !self.proposal.is_nil_block(),
             "Proposal {} for a NIL block",
@@ -92,7 +42,7 @@ impl<T: Payload> ProposalMsg<T> {
         );
         self.proposal
             .verify_well_formed()
-            .with_context(|e| format!("Fail to verify ProposalMsg's block: {:}", e))?;
+            .context("Fail to verify ProposalMsg's block")?;
         ensure!(
             self.proposal.round() > 0,
             "Proposal for {} has an incorrect round of 0",
@@ -127,7 +77,19 @@ impl<T: Payload> ProposalMsg<T> {
             "Proposal {} does not define an author",
             self.proposal
         );
-        Ok(self)
+        Ok(())
+    }
+
+    pub fn verify(&self, validator: &ValidatorVerifier) -> Result<()> {
+        self.proposal
+            .validate_signatures(validator)
+            .map_err(|e| format_err!("{:?}", e))?;
+        // if there is a timeout certificate, verify its signatures
+        if let Some(tc) = self.sync_info.highest_timeout_certificate() {
+            tc.verify(validator).map_err(|e| format_err!("{:?}", e))?;
+        }
+        // Note that we postpone the verification of SyncInfo until it's being used.
+        self.verify_well_formed()
     }
 
     pub fn proposal(&self) -> &Block<T> {
@@ -160,15 +122,5 @@ impl<T: Payload> fmt::Display for ProposalMsg<T> {
             None => String::from("NIL"),
         };
         write!(f, "[proposal {} from {}]", self.proposal, author,)
-    }
-}
-
-impl<T: Payload> TryFrom<ProposalMsg<T>> for network::proto::Proposal {
-    type Error = failure::Error;
-
-    fn try_from(proposal: ProposalMsg<T>) -> failure::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&proposal)?,
-        })
     }
 }

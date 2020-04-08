@@ -13,7 +13,7 @@ source "$HOME/.cargo/env"
 
 SCRIPT_PATH="$(dirname $0)"
 
-RUN_PARAMS="--host ac.testnet.libra.org --port 8001 -s $SCRIPT_PATH/consensus_peers.config.toml"
+RUN_PARAMS="--url https://client.testnet.libra.org "
 RELEASE=""
 
 while [[ ! -z "$1" ]]; do
@@ -38,4 +38,4 @@ else
 	echo "Building and running client in release mode."
 fi
 
-cargo run -p client $RELEASE -- $RUN_PARAMS "$@"
+cargo run -p cli $RELEASE -- $RUN_PARAMS "$@"

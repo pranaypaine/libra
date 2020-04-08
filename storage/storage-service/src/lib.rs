@@ -9,45 +9,76 @@
 //! [`storage-client`](../storage-client/index.html) instead of via
 //! [`StorageClient`](../storage-proto/proto/storage_grpc/struct.StorageClient.html) directly.
 
-#[cfg(feature = "fuzzing")]
+#[cfg(any(feature = "testing", feature = "fuzzing"))]
 pub mod mocks;
 
-use failure::prelude::*;
-use grpc_helpers::{provide_grpc_response, spawn_service_thread_with_drop_closure, ServerHandle};
+use anyhow::Result;
+use futures::{channel::mpsc, sink::SinkExt};
 use libra_config::config::NodeConfig;
 use libra_logger::prelude::*;
-use libra_metrics::counters::SVC_COUNTERS;
-use libra_types::proto::types::{UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse};
+use libra_types::proto::types::{
+    UpdateToLatestLedgerRequest, UpdateToLatestLedgerResponse, ValidatorChangeProof,
+};
 use libradb::LibraDB;
-use std::{
-    convert::TryFrom,
-    ops::Deref,
-    path::Path,
-    sync::{mpsc, Arc, Mutex},
-};
+use std::{convert::TryFrom, path::Path, sync::Arc};
+use storage_interface::{DbReader, DbReaderWriter, DbWriter};
 use storage_proto::proto::storage::{
-    create_storage, GetAccountStateWithProofByVersionRequest,
-    GetAccountStateWithProofByVersionResponse, GetEpochChangeLedgerInfosRequest,
-    GetEpochChangeLedgerInfosResponse, GetStartupInfoRequest, GetStartupInfoResponse,
-    GetTransactionsRequest, GetTransactionsResponse, SaveTransactionsRequest,
-    SaveTransactionsResponse, Storage,
+    storage_server::{Storage, StorageServer},
+    BackupAccountStateRequest, BackupAccountStateResponse, BackupTransactionInfoRequest,
+    BackupTransactionInfoResponse, BackupTransactionRequest, BackupTransactionResponse,
+    GetAccountStateRangeProofRequest, GetAccountStateRangeProofResponse,
+    GetAccountStateWithProofByVersionRequest, GetAccountStateWithProofByVersionResponse,
+    GetEpochChangeLedgerInfosRequest, GetLatestAccountStateRequest, GetLatestAccountStateResponse,
+    GetLatestStateRootRequest, GetLatestStateRootResponse, GetStartupInfoRequest,
+    GetStartupInfoResponse, GetTransactionsRequest, GetTransactionsResponse,
+    SaveTransactionsRequest, SaveTransactionsResponse,
 };
+use tokio::runtime::Runtime;
+
+pub fn init_libra_db(config: &NodeConfig) -> (Arc<LibraDB>, DbReaderWriter) {
+    DbReaderWriter::wrap(LibraDB::new(&config.storage.dir()))
+}
+
+/// Starts storage service with a given LibraDB
+pub fn start_storage_service_with_db(config: &NodeConfig, libra_db: Arc<LibraDB>) -> Runtime {
+    let storage_service = StorageService { db: libra_db };
+    start_storage_service_runtime(config, storage_service)
+}
 
 /// Starts storage service according to config.
-pub fn start_storage_service(config: &NodeConfig) -> ServerHandle {
-    let (storage_service, shutdown_receiver) = StorageService::new(&config.storage.dir());
-    spawn_service_thread_with_drop_closure(
-        create_storage(storage_service),
-        config.storage.address.clone(),
-        config.storage.port,
-        "storage",
-        config.storage.grpc_max_receive_len,
-        move || {
-            shutdown_receiver
-                .recv()
-                .expect("Failed to receive on shutdown channel when storage service was dropped")
-        },
-    )
+pub fn start_storage_service(config: &NodeConfig) -> Runtime {
+    let storage_service = StorageService::new(&config.storage.dir());
+    start_storage_service_runtime(config, storage_service)
+}
+
+fn start_storage_service_runtime(config: &NodeConfig, storage_service: StorageService) -> Runtime {
+    let mut rt = tokio::runtime::Builder::new()
+        .threaded_scheduler()
+        .enable_all()
+        .thread_name("tokio-storage")
+        .build()
+        .unwrap();
+
+    rt.spawn(
+        tonic::transport::Server::builder()
+            .add_service(StorageServer::new(storage_service))
+            .serve(config.storage.address),
+    );
+
+    let addr = format!("http://{}", config.storage.address);
+    for _i in 0..100 {
+        if rt
+            .block_on(
+                storage_proto::proto::storage::storage_client::StorageClient::connect(addr.clone()),
+            )
+            .is_ok()
+        {
+            return rt;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    panic!("Failed to start storage service.");
 }
 
 /// The implementation of the storage [GRPC](http://grpc.io) service.
@@ -56,85 +87,14 @@ pub fn start_storage_service(config: &NodeConfig) -> ServerHandle {
 /// [`LibraDB`].
 #[derive(Clone)]
 pub struct StorageService {
-    db: Arc<LibraDBWrapper>,
-}
-
-/// When dropping GRPC server we want to wait until LibraDB is dropped first, so the RocksDB
-/// instance held by GRPC threads is closed before the main function of GRPC server
-/// finishes. Otherwise, if we don't manually guarantee this, some thread(s) may still be
-/// alive holding an Arc pointer to LibraDB after main function of GRPC server returns.
-/// Having this wrapper with a channel gives us a way to signal the receiving end that all GRPC
-/// server threads are joined so RocksDB is closed.
-///
-/// See these links for more details.
-///   https://github.com/pingcap/grpc-rs/issues/227
-///   https://github.com/facebook/rocksdb/issues/649
-struct LibraDBWrapper {
-    db: Option<LibraDB>,
-    shutdown_sender: Mutex<mpsc::Sender<()>>,
-}
-
-impl LibraDBWrapper {
-    pub fn new<P: AsRef<Path>>(path: &P) -> (Self, mpsc::Receiver<()>) {
-        let db = LibraDB::new(path);
-        let (shutdown_sender, shutdown_receiver) = mpsc::channel();
-        (
-            Self {
-                db: Some(db),
-                shutdown_sender: Mutex::new(shutdown_sender),
-            },
-            shutdown_receiver,
-        )
-    }
-}
-
-impl Drop for LibraDBWrapper {
-    fn drop(&mut self) {
-        // Drop inner LibraDB instance.
-        self.db.take();
-        // Send the shutdown message after DB is dropped.
-        self.shutdown_sender
-            .lock()
-            .expect("Failed to lock mutex.")
-            .send(())
-            .expect("Failed to send shutdown message.");
-    }
-}
-
-impl Deref for LibraDBWrapper {
-    type Target = LibraDB;
-
-    fn deref(&self) -> &Self::Target {
-        self.db.as_ref().expect("LibraDB is dropped unexptectedly")
-    }
+    db: Arc<LibraDB>,
 }
 
 impl StorageService {
     /// This opens a [`LibraDB`] at `path` and returns a [`StorageService`] instance serving it.
-    ///
-    /// A receiver side of a channel is also returned through which one can receive a notice after
-    /// all resources used by the service including the underlying [`LibraDB`] instance are
-    /// fully dropped.
-    ///
-    /// example:
-    /// ```no_run,
-    ///    # use storage_service::*;
-    ///    # use std::path::Path;
-    ///    let (service, shutdown_receiver) = StorageService::new(&Path::new("path/to/db"));
-    ///
-    ///    drop(service);
-    ///    shutdown_receiver.recv().expect("recv() should succeed.");
-    ///
-    ///    // LibraDB instance is guaranteed to be properly dropped at this point.
-    /// ```
-    pub fn new<P: AsRef<Path>>(path: &P) -> (Self, mpsc::Receiver<()>) {
-        let (db_wrapper, shutdown_receiver) = LibraDBWrapper::new(path);
-        (
-            Self {
-                db: Arc::new(db_wrapper),
-            },
-            shutdown_receiver,
-        )
+    pub fn new<P: AsRef<Path>>(path: &P) -> Self {
+        let db = Arc::new(LibraDB::new(path));
+        Self { db }
     }
 }
 
@@ -148,7 +108,7 @@ impl StorageService {
         let (
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         ) = self
             .db
@@ -157,7 +117,7 @@ impl StorageService {
         let rust_resp = libra_types::get_with_proof::UpdateToLatestLedgerResponse {
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         };
 
@@ -179,6 +139,25 @@ impl StorageService {
 
         let rust_resp = storage_proto::GetTransactionsResponse::new(txn_list_with_proof);
 
+        Ok(rust_resp.into())
+    }
+
+    fn get_latest_state_root_inner(
+        &self,
+        _req: GetLatestStateRootRequest,
+    ) -> Result<GetLatestStateRootResponse> {
+        let (version, state_root_hash) = self.db.get_latest_state_root()?;
+        let rust_resp = storage_proto::GetLatestStateRootResponse::new(version, state_root_hash);
+        Ok(rust_resp.into())
+    }
+
+    fn get_latest_account_state_inner(
+        &self,
+        req: GetLatestAccountStateRequest,
+    ) -> Result<GetLatestAccountStateResponse> {
+        let rust_req = storage_proto::GetLatestAccountStateRequest::try_from(req)?;
+        let account_state_blob = self.db.get_latest_account_state(rust_req.address)?;
+        let rust_resp = storage_proto::GetLatestAccountStateResponse::new(account_state_blob);
         Ok(rust_resp.into())
     }
 
@@ -208,7 +187,7 @@ impl StorageService {
         self.db.save_transactions(
             &rust_req.txns_to_commit,
             rust_req.first_version,
-            &rust_req.ledger_info_with_signatures,
+            rust_req.ledger_info_with_signatures.as_ref(),
         )?;
         Ok(SaveTransactionsResponse::default())
     }
@@ -222,87 +201,264 @@ impl StorageService {
     fn get_epoch_change_ledger_infos_inner(
         &self,
         req: GetEpochChangeLedgerInfosRequest,
-    ) -> Result<GetEpochChangeLedgerInfosResponse> {
+    ) -> Result<ValidatorChangeProof> {
         let rust_req = storage_proto::GetEpochChangeLedgerInfosRequest::try_from(req)?;
-        let ledger_infos = self
+        let (ledger_infos, more) = self
             .db
-            .get_epoch_change_ledger_infos(rust_req.start_epoch)?;
-        let rust_resp = storage_proto::GetEpochChangeLedgerInfosResponse::new(ledger_infos);
+            .get_epoch_change_ledger_infos(rust_req.start_epoch, rust_req.end_epoch)?;
+        let rust_resp =
+            libra_types::validator_change::ValidatorChangeProof::new(ledger_infos, more);
+        Ok(rust_resp.into())
+    }
+
+    fn get_account_state_range_proof_inner(
+        &self,
+        req: GetAccountStateRangeProofRequest,
+    ) -> Result<GetAccountStateRangeProofResponse> {
+        let rust_req = storage_proto::GetAccountStateRangeProofRequest::try_from(req)?;
+        let proof = self
+            .db
+            .get_backup_handler()
+            .get_account_state_range_proof(rust_req.rightmost_key, rust_req.version)?;
+        let rust_resp = storage_proto::GetAccountStateRangeProofResponse::new(proof);
         Ok(rust_resp.into())
     }
 }
 
+#[tonic::async_trait]
 impl Storage for StorageService {
-    fn save_transactions(
-        &mut self,
-        ctx: grpcio::RpcContext,
-        req: SaveTransactionsRequest,
-        sink: grpcio::UnarySink<SaveTransactionsResponse>,
-    ) {
-        debug!("[GRPC] Storage::save_transactions");
-        let _timer = SVC_COUNTERS.req(&ctx);
-        let resp = self.save_transactions_inner(req);
-        provide_grpc_response(resp, ctx, sink);
+    async fn save_transactions(
+        &self,
+        request: tonic::Request<SaveTransactionsRequest>,
+    ) -> Result<tonic::Response<SaveTransactionsResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::save_transactions");
+        let req = request.into_inner();
+        let resp = self
+            .save_transactions_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
     }
 
-    fn update_to_latest_ledger(
-        &mut self,
-        ctx: grpcio::RpcContext<'_>,
-        req: UpdateToLatestLedgerRequest,
-        sink: grpcio::UnarySink<UpdateToLatestLedgerResponse>,
-    ) {
-        debug!("[GRPC] Storage::update_to_latest_ledger");
-        let _timer = SVC_COUNTERS.req(&ctx);
-        let resp = self.update_to_latest_ledger_inner(req);
-        provide_grpc_response(resp, ctx, sink);
+    async fn update_to_latest_ledger(
+        &self,
+        request: tonic::Request<UpdateToLatestLedgerRequest>,
+    ) -> Result<tonic::Response<UpdateToLatestLedgerResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::update_to_latest_ledger");
+        let req = request.into_inner();
+        let resp = self
+            .update_to_latest_ledger_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
     }
 
-    fn get_transactions(
-        &mut self,
-        ctx: grpcio::RpcContext,
-        req: GetTransactionsRequest,
-        sink: grpcio::UnarySink<GetTransactionsResponse>,
-    ) {
-        debug!("[GRPC] Storage::get_transactions");
-        let _timer = SVC_COUNTERS.req(&ctx);
-        let resp = self.get_transactions_inner(req);
-        provide_grpc_response(resp, ctx, sink);
+    async fn get_transactions(
+        &self,
+        request: tonic::Request<GetTransactionsRequest>,
+    ) -> Result<tonic::Response<GetTransactionsResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::get_transactions");
+        let req = request.into_inner();
+        let resp = self
+            .get_transactions_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
     }
 
-    fn get_account_state_with_proof_by_version(
-        &mut self,
-        ctx: grpcio::RpcContext,
-        req: GetAccountStateWithProofByVersionRequest,
-        sink: grpcio::UnarySink<GetAccountStateWithProofByVersionResponse>,
-    ) {
-        debug!("[GRPC] Storage::get_account_state_with_proof_by_version");
-        let _timer = SVC_COUNTERS.req(&ctx);
-        let resp = self.get_account_state_with_proof_by_version_inner(req);
-        provide_grpc_response(resp, ctx, sink);
+    async fn get_latest_state_root(
+        &self,
+        request: tonic::Request<GetLatestStateRootRequest>,
+    ) -> Result<tonic::Response<GetLatestStateRootResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::get_latest_state_root");
+        let req = request.into_inner();
+        let resp = self
+            .get_latest_state_root_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
     }
 
-    fn get_startup_info(
-        &mut self,
-        ctx: grpcio::RpcContext,
-        _req: GetStartupInfoRequest,
-        sink: grpcio::UnarySink<GetStartupInfoResponse>,
-    ) {
-        debug!("[GRPC] Storage::get_startup_info");
-        let _timer = SVC_COUNTERS.req(&ctx);
-        let resp = self.get_startup_info_inner();
-        provide_grpc_response(resp, ctx, sink);
+    async fn get_latest_account_state(
+        &self,
+        request: tonic::Request<GetLatestAccountStateRequest>,
+    ) -> Result<tonic::Response<GetLatestAccountStateResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::get_latest_account_state");
+        let req = request.into_inner();
+        let resp = self
+            .get_latest_account_state_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
     }
 
-    fn get_epoch_change_ledger_infos(
-        &mut self,
-        ctx: grpcio::RpcContext,
-        req: GetEpochChangeLedgerInfosRequest,
-        sink: grpcio::UnarySink<GetEpochChangeLedgerInfosResponse>,
-    ) {
-        debug!("[GRPC] Storage::get_epoch_change_ledger_infos");
-        let _timer = SVC_COUNTERS.req(&ctx);
-        let resp = self.get_epoch_change_ledger_infos_inner(req);
-        provide_grpc_response(resp, ctx, sink);
+    async fn get_account_state_with_proof_by_version(
+        &self,
+        request: tonic::Request<GetAccountStateWithProofByVersionRequest>,
+    ) -> Result<tonic::Response<GetAccountStateWithProofByVersionResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::get_account_state_with_proof_by_version");
+        let req = request.into_inner();
+        let resp = self
+            .get_account_state_with_proof_by_version_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
+    }
+
+    async fn get_startup_info(
+        &self,
+        _request: tonic::Request<GetStartupInfoRequest>,
+    ) -> Result<tonic::Response<GetStartupInfoResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::get_startup_info");
+        let resp = self
+            .get_startup_info_inner()
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
+    }
+
+    async fn get_epoch_change_ledger_infos(
+        &self,
+        request: tonic::Request<GetEpochChangeLedgerInfosRequest>,
+    ) -> Result<tonic::Response<ValidatorChangeProof>, tonic::Status> {
+        trace!("[GRPC] Storage::get_epoch_change_ledger_infos");
+        let req = request.into_inner();
+        let resp = self
+            .get_epoch_change_ledger_infos_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
+    }
+
+    type BackupAccountStateStream =
+        mpsc::Receiver<Result<BackupAccountStateResponse, tonic::Status>>;
+
+    async fn backup_account_state(
+        &self,
+        request: tonic::Request<BackupAccountStateRequest>,
+    ) -> Result<tonic::Response<Self::BackupAccountStateStream>, tonic::Status> {
+        trace!("[GRPC] Storage::backup_account_state");
+        let req = request.into_inner();
+        let iter = self
+            .db
+            .get_backup_handler()
+            .get_account_iter(req.version)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+
+        let iter = iter.map(|res| match res {
+            Ok((hash, blob)) => {
+                let resp: BackupAccountStateResponse =
+                    storage_proto::BackupAccountStateResponse::new(hash, blob).into();
+                Ok(resp)
+            }
+            Err(e) => Err(tonic::Status::new(tonic::Code::Internal, e.to_string())),
+        });
+
+        // Channel to buffer the stream
+        let (mut tx, rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            for resp in iter {
+                tx.send(resp).await.unwrap();
+            }
+        });
+
+        Ok(tonic::Response::new(rx))
+    }
+
+    async fn get_account_state_range_proof(
+        &self,
+        request: tonic::Request<GetAccountStateRangeProofRequest>,
+    ) -> Result<tonic::Response<GetAccountStateRangeProofResponse>, tonic::Status> {
+        trace!("[GRPC] Storage::get_account_state_range_proof");
+        let req = request.into_inner();
+        let resp = self
+            .get_account_state_range_proof_inner(req)
+            .map_err(|e| tonic::Status::new(tonic::Code::InvalidArgument, e.to_string()))?;
+        Ok(tonic::Response::new(resp))
+    }
+
+    type BackupTransactionStream = mpsc::Receiver<Result<BackupTransactionResponse, tonic::Status>>;
+
+    async fn backup_transaction(
+        &self,
+        request: tonic::Request<BackupTransactionRequest>,
+    ) -> Result<tonic::Response<Self::BackupTransactionStream>, tonic::Status> {
+        trace!("[GRPC] Storage::backup_transaction");
+        let req = request.into_inner();
+
+        let backup_handler = self.db.get_backup_handler();
+        let (mut tx, rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            let iter = match backup_handler
+                .get_transaction_iter(req.start_version, req.num_transactions)
+            {
+                Ok(iter) => iter,
+                Err(e) => {
+                    tx.send(Err(tonic::Status::new(
+                        tonic::Code::Internal,
+                        e.to_string(),
+                    )))
+                    .await
+                    .unwrap();
+                    return;
+                }
+            };
+
+            let iter = iter.map(|res| match res {
+                Ok(transaction) => {
+                    let resp: BackupTransactionResponse =
+                        storage_proto::BackupTransactionResponse { transaction }.into();
+                    Ok(resp)
+                }
+                Err(e) => Err(tonic::Status::new(tonic::Code::Internal, e.to_string())),
+            });
+
+            for resp in iter {
+                tx.send(resp).await.unwrap();
+            }
+        });
+
+        Ok(tonic::Response::new(rx))
+    }
+
+    type BackupTransactionInfoStream =
+        mpsc::Receiver<Result<BackupTransactionInfoResponse, tonic::Status>>;
+
+    async fn backup_transaction_info(
+        &self,
+        request: tonic::Request<BackupTransactionInfoRequest>,
+    ) -> Result<tonic::Response<Self::BackupTransactionInfoStream>, tonic::Status> {
+        trace!("[GRPC] Storage::backup_transaction_info");
+        let req = request.into_inner();
+
+        let backup_handler = self.db.get_backup_handler();
+        let (mut tx, rx) = mpsc::channel(32);
+
+        tokio::spawn(async move {
+            let iter = match backup_handler
+                .get_transaction_info_iter(req.start_version, req.num_transactions)
+            {
+                Ok(iter) => iter,
+                Err(e) => {
+                    tx.send(Err(tonic::Status::new(
+                        tonic::Code::Internal,
+                        e.to_string(),
+                    )))
+                    .await
+                    .unwrap();
+                    return;
+                }
+            };
+
+            let iter = iter.map(|res| match res {
+                Ok(transaction_info) => {
+                    let resp: BackupTransactionInfoResponse =
+                        storage_proto::BackupTransactionInfoResponse { transaction_info }.into();
+                    Ok(resp)
+                }
+                Err(e) => Err(tonic::Status::new(tonic::Code::Internal, e.to_string())),
+            });
+
+            for resp in iter {
+                tx.send(resp).await.unwrap();
+            }
+        });
+
+        Ok(tonic::Response::new(rx))
     }
 }
 

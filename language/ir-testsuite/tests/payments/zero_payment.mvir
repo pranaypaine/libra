@@ -1,0 +1,20 @@
+import 0x0.LibraAccount;
+import 0x0.LBR;
+import 0x0.Libra;
+
+main() {
+    let addr: address;
+    let old_balance: u64;
+
+    addr = get_txn_sender();
+    old_balance = LibraAccount.balance<LBR.T>(copy(addr));
+
+    LibraAccount.deposit<LBR.T>(copy(addr), Libra.zero<LBR.T>());
+
+    assert(LibraAccount.balance<LBR.T>(copy(addr)) == move(old_balance), 42);
+
+    return;
+}
+
+// check: ABORTED
+// check: 7

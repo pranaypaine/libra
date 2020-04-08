@@ -1,18 +1,25 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use failure::prelude::*;
-use libra_config::config::NodeConfig;
-use network::validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender};
-
-use crate::chained_bft::chained_bft_consensus_provider::ChainedBftProvider;
+use crate::{
+    chained_bft::{
+        chained_bft_smr::ChainedBftSMR,
+        network_interface::{ConsensusNetworkEvents, ConsensusNetworkSender},
+        persistent_liveness_storage::StorageWriteProxy,
+    },
+    state_computer::ExecutionProxy,
+    txn_manager::MempoolProxy,
+};
+use anyhow::Result;
 use executor::Executor;
-use grpcio::{ChannelBuilder, EnvBuilder};
-use libra_mempool::proto::mempool::MempoolClient;
+use futures::channel::mpsc;
+use libra_config::config::NodeConfig;
+use libra_mempool::ConsensusRequest;
+use libra_types::transaction::SignedTransaction;
+use libra_vm::LibraVM;
 use state_synchronizer::StateSyncClient;
-use std::sync::Arc;
-use storage_client::{StorageRead, StorageReadServiceClient};
-use vm_runtime::MoveVM;
+use std::sync::{Arc, Mutex};
+use storage_interface::DbReader;
 
 /// Public interface to a consensus protocol.
 pub trait ConsensusProvider {
@@ -30,38 +37,23 @@ pub trait ConsensusProvider {
 /// Helper function to create a ConsensusProvider based on configuration
 pub fn make_consensus_provider(
     node_config: &mut NodeConfig,
-    network_sender: ConsensusNetworkSender,
-    network_receiver: ConsensusNetworkEvents,
-    executor: Arc<Executor<MoveVM>>,
+    network_sender: ConsensusNetworkSender<Vec<SignedTransaction>>,
+    network_receiver: ConsensusNetworkEvents<Vec<SignedTransaction>>,
+    executor: Arc<Mutex<Executor<LibraVM>>>,
     state_sync_client: Arc<StateSyncClient>,
+    consensus_to_mempool_sender: mpsc::Sender<ConsensusRequest>,
+    libra_db: Arc<dyn DbReader>,
 ) -> Box<dyn ConsensusProvider> {
-    Box::new(ChainedBftProvider::new(
-        node_config,
+    let storage = Arc::new(StorageWriteProxy::new(node_config, libra_db));
+    let txn_manager = Box::new(MempoolProxy::new(consensus_to_mempool_sender));
+    let state_computer = Arc::new(ExecutionProxy::new(executor, state_sync_client));
+
+    Box::new(ChainedBftSMR::new(
         network_sender,
         network_receiver,
-        create_mempool_client(node_config),
-        executor,
-        state_sync_client,
-    ))
-}
-
-/// Create a mempool client assuming the mempool is running on localhost
-fn create_mempool_client(config: &NodeConfig) -> Arc<MempoolClient> {
-    let port = config.mempool.mempool_service_port;
-    let connection_str = format!("localhost:{}", port);
-
-    let env = Arc::new(EnvBuilder::new().name_prefix("grpc-con-mem-").build());
-    Arc::new(MempoolClient::new(
-        ChannelBuilder::new(env).connect(&connection_str),
-    ))
-}
-
-/// Create a storage read client based on the config
-pub fn create_storage_read_client(config: &NodeConfig) -> Arc<dyn StorageRead> {
-    let env = Arc::new(EnvBuilder::new().name_prefix("grpc-con-sto-").build());
-    Arc::new(StorageReadServiceClient::new(
-        env,
-        &config.storage.address,
-        config.storage.port,
+        node_config,
+        state_computer,
+        storage,
+        txn_manager,
     ))
 }

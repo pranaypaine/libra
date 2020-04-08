@@ -1,13 +1,11 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 //! This module has definition of various proofs.
 
 #[cfg(test)]
-#[path = "unit_tests/proof_proto_conversion_test.rs"]
-mod proof_proto_conversion_test;
+#[path = "unit_tests/proof_conversion_test.rs"]
+mod proof_conversion_test;
 
 use super::{
     position::Position, verify_transaction_info, MerkleTreeInternalNode, SparseMerkleInternalNode,
@@ -18,7 +16,7 @@ use crate::{
     ledger_info::LedgerInfo,
     transaction::{TransactionInfo, Version},
 };
-use failure::prelude::*;
+use anyhow::{bail, ensure, format_err, Error, Result};
 #[cfg(any(test, feature = "fuzzing"))]
 use libra_crypto::hash::TestOnlyHasher;
 use libra_crypto::{
@@ -30,8 +28,11 @@ use libra_crypto::{
 };
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use std::convert::{TryFrom, TryInto};
-use std::marker::PhantomData;
+use serde::{Deserialize, Serialize};
+use std::{
+    convert::{TryFrom, TryInto},
+    marker::PhantomData,
+};
 
 /// Converts sibling nodes from Protobuf format to Rust format, using the fact that empty byte
 /// arrays represent placeholder hashes.
@@ -78,7 +79,7 @@ fn into_proto_siblings(siblings: Vec<HashValue>, placeholder: HashValue) -> Vec<
 /// A proof that can be used authenticate an element in an accumulator given trusted root hash. For
 /// example, both `LedgerInfoToTransactionInfoProof` and `TransactionInfoToEventProof` can be
 /// constructed on top of this structure.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AccumulatorProof<H> {
     /// All siblings in this proof, including the default ones. Siblings are ordered from the bottom
     /// level to the root level.
@@ -199,7 +200,7 @@ pub type TestAccumulatorProof = AccumulatorProof<TestOnlyHasher>;
 
 /// A proof that can be used to authenticate an element in a Sparse Merkle Tree given trusted root
 /// hash. For example, `TransactionInfoToAccountProof` can be constructed on top of this structure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SparseMerkleProof {
     /// This proof can be used to authenticate whether a given leaf exists in the tree or not.
     ///     - If this is `Some(HashValue, HashValue)`
@@ -374,7 +375,7 @@ impl From<SparseMerkleProof> for crate::proto::types::SparseMerkleProof {
 /// leaves, it can be convinced that the two accumulators are consistent.
 ///
 /// See [`crate::proof::accumulator::Accumulator::append_subtrees`] for more details.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AccumulatorConsistencyProof {
     /// The subtrees representing the newly appended leaves.
     subtrees: Vec<HashValue>,
@@ -432,7 +433,7 @@ impl From<AccumulatorConsistencyProof> for crate::proto::types::AccumulatorConsi
 ///
 /// if the proof wants to show that `[a, b, c]` exists in the accumulator, it would need `X` on the
 /// left and `Y` and `Z` on the right.
-#[derive(Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AccumulatorRangeProof<H> {
     /// The siblings on the left of the path from the first leaf to the root. Siblings near the root
     /// are at the beginning of the vector.
@@ -461,6 +462,11 @@ where
     /// Constructs a new `AccumulatorRangeProof` for an empty list of leaves.
     pub fn new_empty() -> Self {
         Self::new(vec![], vec![])
+    }
+
+    /// Get all the left siblngs.
+    pub fn left_siblings(&self) -> &Vec<HashValue> {
+        &self.left_siblings
     }
 
     /// Verifies the proof is correct. The verifier needs to have `expected_root_hash`, the index
@@ -631,22 +637,40 @@ pub type TestAccumulatorRangeProof = AccumulatorRangeProof<TestOnlyHasher>;
 ///
 /// if the proof wants show that `[a, b, c, d, e]` exists in the tree, it would need the siblings
 /// `X` and `h` on the right.
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SparseMerkleRangeProof {
-    /// The vector of siblings. The ones near the bottom are at the beginning of the vector. In the
-    /// above example, it's `[X, h]`.
-    siblings: Vec<HashValue>,
+    /// The vector of siblings on the right of the path from root to last leaf. The ones near the
+    /// bottom are at the beginning of the vector. In the above example, it's `[X, h]`.
+    right_siblings: Vec<HashValue>,
 }
 
 impl SparseMerkleRangeProof {
     /// Constructs a new `SparseMerkleRangeProof`.
-    pub fn new(siblings: Vec<HashValue>) -> Self {
-        Self { siblings }
+    pub fn new(right_siblings: Vec<HashValue>) -> Self {
+        Self { right_siblings }
     }
 
     /// Returns the siblings.
-    pub fn siblings(&self) -> &[HashValue] {
-        &self.siblings
+    pub fn right_siblings(&self) -> &[HashValue] {
+        &self.right_siblings
+    }
+}
+
+impl TryFrom<crate::proto::types::SparseMerkleRangeProof> for SparseMerkleRangeProof {
+    type Error = Error;
+
+    fn try_from(proto_proof: crate::proto::types::SparseMerkleRangeProof) -> Result<Self> {
+        let right_siblings =
+            from_proto_siblings(proto_proof.right_siblings, *SPARSE_MERKLE_PLACEHOLDER_HASH)?;
+        Ok(Self::new(right_siblings))
+    }
+}
+
+impl From<SparseMerkleRangeProof> for crate::proto::types::SparseMerkleRangeProof {
+    fn from(proof: SparseMerkleRangeProof) -> Self {
+        let right_siblings =
+            into_proto_siblings(proof.right_siblings, *SPARSE_MERKLE_PLACEHOLDER_HASH);
+        Self { right_siblings }
     }
 }
 
@@ -654,7 +678,7 @@ impl SparseMerkleRangeProof {
 /// `AccumulatorProof` from `LedgerInfo` to `TransactionInfo` the verifier needs to verify the
 /// correctness of the `TransactionInfo` object, and the `TransactionInfo` object that is supposed
 /// to match the `Transaction`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct TransactionProof {
     /// The accumulator proof from ledger info root to leaf that authenticates the hash of the
@@ -759,7 +783,7 @@ impl From<TransactionProof> for crate::proto::types::TransactionProof {
 /// The complete proof used to authenticate the state of an account. This structure consists of the
 /// `AccumulatorProof` from `LedgerInfo` to `TransactionInfo`, the `TransactionInfo` object and the
 /// `SparseMerkleProof` from state root to the account.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct AccountStateProof {
     /// The accumulator proof from ledger info root to leaf that authenticates the hash of the
@@ -869,7 +893,7 @@ impl From<AccountStateProof> for crate::proto::types::AccountStateProof {
 /// The complete proof used to authenticate a contract event. This structure consists of the
 /// `AccumulatorProof` from `LedgerInfo` to `TransactionInfo`, the `TransactionInfo` object and the
 /// `AccumulatorProof` from event accumulator root to the event.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct EventProof {
     /// The accumulator proof from ledger info root to leaf that authenticates the hash of the
@@ -976,7 +1000,7 @@ impl From<EventProof> for crate::proto::types::EventProof {
 }
 
 /// The complete proof used to authenticate a list of consecutive transactions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct TransactionListProof {
     /// The accumulator range proof from ledger info root to leaves that authenticates the hashes
@@ -1008,6 +1032,10 @@ impl TransactionListProof {
     /// Returns the list of `TransactionInfo` objects.
     pub fn transaction_infos(&self) -> &[TransactionInfo] {
         &self.transaction_infos
+    }
+
+    pub fn left_siblings(&self) -> &Vec<HashValue> {
+        self.ledger_info_to_transaction_infos_proof.left_siblings()
     }
 
     /// Verifies the list of transactions are correct using the proof. The verifier needs to have

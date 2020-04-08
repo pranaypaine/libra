@@ -3,61 +3,112 @@
 
 #![forbid(unsafe_code)]
 
-use ir_to_bytecode::{compiler::compile_program, parser::ast};
-use lazy_static::lazy_static;
-use libra_config::config::{VMConfig, VMPublishingOption};
-use libra_crypto::HashValue;
-use libra_types::block_metadata::BlockMetadata;
+#[cfg(any(test, feature = "fuzzing"))]
+use libra_types::account_config;
 use libra_types::{
     account_address::AccountAddress,
-    byte_array::ByteArray,
-    transaction::{Script, Transaction, TransactionArgument, SCRIPT_HASH_LENGTH},
+    block_metadata::BlockMetadata,
+    language_storage::TypeTag,
+    on_chain_config::{LibraVersion, VMPublishingOption},
+    transaction::{authenticator::AuthenticationKey, Script, Transaction, TransactionArgument},
 };
-use std::{collections::HashSet, iter::FromIterator};
-use stdlib::{
-    stdlib_modules,
-    transaction_scripts::{
-        BLOCK_PROLOGUE_TXN_BODY, CREATE_ACCOUNT_TXN_BODY, MINT_TXN_BODY,
-        PEER_TO_PEER_TRANSFER_TXN_BODY, PEER_TO_PEER_TRANSFER_WITH_METADATA_TXN_BODY,
-        ROTATE_AUTHENTICATION_KEY_TXN_BODY, ROTATE_CONSENSUS_PUBKEY_TXN_BODY,
-    },
-};
+use mirai_annotations::*;
+use std::convert::TryFrom;
+use stdlib::transaction_scripts::StdlibScript;
 #[cfg(any(test, feature = "fuzzing"))]
-use vm::file_format::Bytecode;
+use vm::file_format::{Bytecode, CompiledScript};
 
-lazy_static! {
-    static ref PEER_TO_PEER_TXN: Vec<u8> = { compile_script(&PEER_TO_PEER_TRANSFER_TXN_BODY) };
-    static ref PEER_TO_PEER_WITH_METADATA_TXN: Vec<u8> =
-        { compile_script(&PEER_TO_PEER_TRANSFER_WITH_METADATA_TXN_BODY) };
-    static ref CREATE_ACCOUNT_TXN: Vec<u8> = { compile_script(&CREATE_ACCOUNT_TXN_BODY) };
-    static ref ROTATE_AUTHENTICATION_KEY_TXN: Vec<u8> =
-        { compile_script(&ROTATE_AUTHENTICATION_KEY_TXN_BODY) };
-    static ref ROTATE_CONSENSUS_PUBKEY_TXN: Vec<u8> =
-        { compile_script(&ROTATE_CONSENSUS_PUBKEY_TXN_BODY) };
-    static ref MINT_TXN: Vec<u8> = { compile_script(&MINT_TXN_BODY) };
-    static ref BLOCK_PROLOGUE_TXN: Vec<u8> = { compile_script(&BLOCK_PROLOGUE_TXN_BODY) };
+fn validate_auth_key_prefix(auth_key_prefix: &[u8]) {
+    let auth_key_prefix_length = auth_key_prefix.len();
+    checked_assume!(
+        auth_key_prefix_length == 0
+            || auth_key_prefix_length == AuthenticationKey::LENGTH - AccountAddress::LENGTH,
+        "Bad auth key prefix length {}",
+        auth_key_prefix_length
+    );
 }
 
-fn compile_script(body: &ast::Program) -> Vec<u8> {
-    let compiled_program =
-        compile_program(AccountAddress::default(), body.clone(), stdlib_modules())
-            .unwrap()
-            .0;
-    let mut script_bytes = vec![];
-    compiled_program
-        .script
-        .serialize(&mut script_bytes)
-        .unwrap();
-    script_bytes
+/// Encode `stdlib_script` with arguments `args`.
+/// Note: this is not type-safe; the individual type-safe wrappers below should be used when
+/// possible.
+pub fn encode_stdlib_script(
+    stdlib_script: StdlibScript,
+    type_args: Vec<TypeTag>,
+    args: Vec<TransactionArgument>,
+) -> Script {
+    Script::new(stdlib_script.compiled_bytes().into_vec(), type_args, args)
+}
+
+/// Encode a program adding `new_validator` to the pending validator set. Fails if the
+/// `new_validator` address is already in the validator set, already in the pending valdiator set,
+/// or does not have a `ValidatorConfig` resource stored at the address
+pub fn encode_add_validator_script(new_validator: &AccountAddress) -> Script {
+    Script::new(
+        StdlibScript::AddValidator.compiled_bytes().into_vec(),
+        vec![],
+        vec![TransactionArgument::Address(*new_validator)],
+    )
+}
+
+/// Encode a program that deposits `amount` LBR in `payee`'s account if the `signature` on the
+/// payment metadata matches the public key stored in the `payee`'s ApprovedPayment` resource.
+/// Aborts if the signature does not match, `payee` does not have an `ApprovedPayment` resource, or
+/// the sender's balance is less than `amount`.
+pub fn encode_approved_payment_script(
+    type_: TypeTag,
+    payee: AccountAddress,
+    amount: u64,
+    metadata: Vec<u8>,
+    signature: Vec<u8>,
+) -> Script {
+    Script::new(
+        StdlibScript::ApprovedPayment.compiled_bytes().into_vec(),
+        vec![type_],
+        vec![
+            TransactionArgument::Address(payee),
+            TransactionArgument::U64(amount),
+            TransactionArgument::U8Vector(metadata),
+            TransactionArgument::U8Vector(signature),
+        ],
+    )
+}
+
+/// Permanently destroy the coins stored in the oldest burn request under the `Preburn` resource
+/// stored at `preburn_address`. This will only succeed if the sender has a `MintCapability` stored
+/// under their account and `preburn_address` has a pending burn request
+pub fn encode_burn_script(type_: TypeTag, preburn_address: AccountAddress) -> Script {
+    Script::new(
+        StdlibScript::Burn.compiled_bytes().into_vec(),
+        vec![type_],
+        vec![TransactionArgument::Address(preburn_address)],
+    )
+}
+
+/// Cancel the oldest burn request from `preburn_address` and return the funds to `preburn_address`.
+/// Fails if the sender does not have a published `MintCapability`.
+pub fn encode_cancel_burn_script(type_: TypeTag, preburn_address: AccountAddress) -> Script {
+    Script::new(
+        StdlibScript::CancelBurn.compiled_bytes().into_vec(),
+        vec![type_],
+        vec![TransactionArgument::Address(preburn_address)],
+    )
 }
 
 /// Encode a program transferring `amount` coins from `sender` to `recipient`. Fails if there is no
 /// account at the recipient address or if the sender's balance is lower than `amount`.
-pub fn encode_transfer_script(recipient: &AccountAddress, amount: u64) -> Script {
+pub fn encode_transfer_script(
+    type_: TypeTag,
+    recipient: &AccountAddress,
+    auth_key_prefix: Vec<u8>,
+    amount: u64,
+) -> Script {
+    validate_auth_key_prefix(&auth_key_prefix);
     Script::new(
-        PEER_TO_PEER_TXN.clone(),
+        StdlibScript::PeerToPeer.compiled_bytes().into_vec(),
+        vec![type_],
         vec![
             TransactionArgument::Address(*recipient),
+            TransactionArgument::U8Vector(auth_key_prefix),
             TransactionArgument::U64(amount),
         ],
     )
@@ -67,21 +118,28 @@ pub fn encode_transfer_script(recipient: &AccountAddress, amount: u64) -> Script
 /// metadata `metadata`. Fails if there is no account at the recipient address or if the sender's
 /// balance is lower than `amount`.
 pub fn encode_transfer_with_metadata_script(
+    type_: TypeTag,
     recipient: &AccountAddress,
+    auth_key_prefix: Vec<u8>,
     amount: u64,
     metadata: Vec<u8>,
 ) -> Script {
+    validate_auth_key_prefix(&auth_key_prefix);
     Script::new(
-        PEER_TO_PEER_WITH_METADATA_TXN.clone(),
+        StdlibScript::PeerToPeerWithMetadata
+            .compiled_bytes()
+            .into_vec(),
+        vec![type_],
         vec![
             TransactionArgument::Address(*recipient),
+            TransactionArgument::U8Vector(auth_key_prefix),
             TransactionArgument::U64(amount),
-            TransactionArgument::ByteArray(ByteArray::new(metadata)),
+            TransactionArgument::U8Vector(metadata),
         ],
     )
 }
 
-/// Encode a program transferring `amount` coins from `sender` to `recipient` but padd the output
+/// Encode a program transferring `amount` coins from `sender` to `recipient` but pad the output
 /// bytecode with unreachable instructions.
 #[cfg(any(test, feature = "fuzzing"))]
 pub fn encode_transfer_script_with_padding(
@@ -89,15 +147,10 @@ pub fn encode_transfer_script_with_padding(
     amount: u64,
     padding_size: u64,
 ) -> Script {
-    let mut script_mut = compile_program(
-        AccountAddress::default(),
-        PEER_TO_PEER_TRANSFER_TXN_BODY.clone(),
-        stdlib_modules(),
-    )
-    .unwrap()
-    .0
-    .script
-    .into_inner();
+    let mut script_mut =
+        CompiledScript::deserialize(&StdlibScript::PeerToPeer.compiled_bytes().into_vec())
+            .unwrap()
+            .into_inner();
     script_mut
         .main
         .code
@@ -112,10 +165,22 @@ pub fn encode_transfer_script_with_padding(
 
     Script::new(
         script_bytes,
+        vec![account_config::lbr_type_tag()],
         vec![
             TransactionArgument::Address(*recipient),
+            TransactionArgument::U8Vector(vec![]), // use empty auth key prefix
             TransactionArgument::U64(amount),
         ],
+    )
+}
+
+/// Preburn `amount` coins from the sender's account.
+/// This will only succeed if the sender already has a published `Preburn` resource.
+pub fn encode_preburn_script(type_: TypeTag, amount: u64) -> Script {
+    Script::new(
+        StdlibScript::Preburn.compiled_bytes().into_vec(),
+        vec![type_],
+        vec![TransactionArgument::U64(amount)],
     )
 }
 
@@ -124,22 +189,88 @@ pub fn encode_transfer_script_with_padding(
 /// `account_address` or if the sender's balance is lower than `initial_balance`.
 pub fn encode_create_account_script(
     account_address: &AccountAddress,
+    auth_key_prefix: Vec<u8>,
     initial_balance: u64,
 ) -> Script {
+    validate_auth_key_prefix(&auth_key_prefix);
     Script::new(
-        CREATE_ACCOUNT_TXN.clone(),
+        StdlibScript::CreateAccount.compiled_bytes().into_vec(),
+        vec![],
         vec![
             TransactionArgument::Address(*account_address),
+            TransactionArgument::U8Vector(auth_key_prefix),
             TransactionArgument::U64(initial_balance),
         ],
+    )
+}
+
+/// Publish a newly created `ApprovedPayment` resource under the sender's account with approval key
+/// `public_key`.
+/// Aborts if the sender already has a published `ApprovedPayment` resource.
+pub fn encode_register_approved_payment_script(public_key: Vec<u8>) -> Script {
+    Script::new(
+        StdlibScript::RegisterApprovedPayment
+            .compiled_bytes()
+            .into_vec(),
+        vec![],
+        vec![TransactionArgument::U8Vector(public_key)],
+    )
+}
+
+/// Publish a newly created `Preburn` resource under the sender's account.
+/// This will fail if the sender already has a published `Preburn` resource.
+pub fn encode_register_preburner_script(type_: TypeTag) -> Script {
+    Script::new(
+        StdlibScript::RegisterPreburner.compiled_bytes().into_vec(),
+        vec![type_],
+        vec![],
+    )
+}
+
+/// Encode a program registering the sender as a candidate validator with the given key information.
+/// `network_signing_pubkey` should be a Ed25519 public key
+/// `network_identity_pubkey` should be a X25519 public key
+/// `consensus_pubkey` should be a Ed25519 public c=key
+pub fn encode_register_validator_script(
+    consensus_pubkey: Vec<u8>,
+    validator_network_signing_pubkey: Vec<u8>,
+    validator_network_identity_pubkey: Vec<u8>,
+    validator_network_address: Vec<u8>,
+    fullnodes_network_identity_pubkey: Vec<u8>,
+    fullnodes_network_address: Vec<u8>,
+) -> Script {
+    Script::new(
+        StdlibScript::RegisterValidator.compiled_bytes().into_vec(),
+        vec![],
+        vec![
+            TransactionArgument::U8Vector(consensus_pubkey),
+            TransactionArgument::U8Vector(validator_network_signing_pubkey),
+            TransactionArgument::U8Vector(validator_network_identity_pubkey),
+            TransactionArgument::U8Vector(validator_network_address),
+            TransactionArgument::U8Vector(fullnodes_network_identity_pubkey),
+            TransactionArgument::U8Vector(fullnodes_network_address),
+        ],
+    )
+}
+
+/// Encode a program adding `to_remove` to the set of pending validator removals. Fails if
+/// the `to_remove` address is already in the validator set or already in the pending removals.
+pub fn encode_remove_validator_script(to_remove: &AccountAddress) -> Script {
+    Script::new(
+        StdlibScript::RemoveValidator.compiled_bytes().into_vec(),
+        vec![],
+        vec![TransactionArgument::Address(*to_remove)],
     )
 }
 
 /// Encode a program that rotates the sender's consensus public key to `new_key`.
 pub fn encode_rotate_consensus_pubkey_script(new_key: Vec<u8>) -> Script {
     Script::new(
-        ROTATE_CONSENSUS_PUBKEY_TXN.clone(),
-        vec![TransactionArgument::ByteArray(ByteArray::new(new_key))],
+        StdlibScript::RotateConsensusPubkey
+            .compiled_bytes()
+            .into_vec(),
+        vec![],
+        vec![TransactionArgument::U8Vector(new_key)],
     )
 }
 
@@ -147,22 +278,49 @@ pub fn encode_rotate_consensus_pubkey_script(new_key: Vec<u8>) -> Script {
 /// a 256 bit sha3 hash of an ed25519 public key.
 pub fn rotate_authentication_key_script(new_hashed_key: Vec<u8>) -> Script {
     Script::new(
-        ROTATE_AUTHENTICATION_KEY_TXN.clone(),
-        vec![TransactionArgument::ByteArray(ByteArray::new(
-            new_hashed_key,
-        ))],
+        StdlibScript::RotateAuthenticationKey
+            .compiled_bytes()
+            .into_vec(),
+        vec![],
+        vec![TransactionArgument::U8Vector(new_hashed_key)],
     )
 }
 
 // TODO: this should go away once we are no longer using it in tests
 /// Encode a program creating `amount` coins for sender
-pub fn encode_mint_script(sender: &AccountAddress, amount: u64) -> Script {
+pub fn encode_mint_script(
+    sender: &AccountAddress,
+    auth_key_prefix: Vec<u8>,
+    amount: u64,
+) -> Script {
+    validate_auth_key_prefix(&auth_key_prefix);
     Script::new(
-        MINT_TXN.clone(),
+        StdlibScript::Mint.compiled_bytes().into_vec(),
+        vec![],
         vec![
             TransactionArgument::Address(*sender),
+            TransactionArgument::U8Vector(auth_key_prefix),
             TransactionArgument::U64(amount),
         ],
+    )
+}
+
+pub fn encode_publishing_option_script(config: VMPublishingOption) -> Script {
+    let bytes = lcs::to_bytes(&config).expect("Cannot deserialize VMPublishingOption");
+    Script::new(
+        StdlibScript::ModifyPublishingOption
+            .compiled_bytes()
+            .into_vec(),
+        vec![],
+        vec![TransactionArgument::U8Vector(bytes)],
+    )
+}
+
+pub fn encode_update_libra_version(libra_version: LibraVersion) -> Script {
+    Script::new(
+        StdlibScript::UpdateLibraVersion.compiled_bytes().into_vec(),
+        vec![],
+        vec![TransactionArgument::U64(libra_version.major as u64)],
     )
 }
 
@@ -171,38 +329,11 @@ pub fn encode_block_prologue_script(block_metadata: BlockMetadata) -> Transactio
     Transaction::BlockMetadata(block_metadata)
 }
 
+// TODO: delete and use StdlibScript::try_from directly if it's ok to drop the "_transaction"?
 /// Returns a user friendly mnemonic for the transaction type if the transaction is
 /// for a known, white listed, transaction.
 pub fn get_transaction_name(code: &[u8]) -> String {
-    if code == &PEER_TO_PEER_TXN[..] {
-        return "peer_to_peer_transaction".to_string();
-    } else if code == &CREATE_ACCOUNT_TXN[..] {
-        return "create_account_transaction".to_string();
-    } else if code == &MINT_TXN[..] {
-        return "mint_transaction".to_string();
-    } else if code == &ROTATE_AUTHENTICATION_KEY_TXN[..] {
-        return "rotate_authentication_key_transaction".to_string();
-    }
-    "<unknown transaction>".to_string()
-}
-
-pub fn allowing_script_hashes() -> Vec<[u8; SCRIPT_HASH_LENGTH]> {
-    vec![
-        MINT_TXN.clone(),
-        PEER_TO_PEER_TXN.clone(),
-        PEER_TO_PEER_WITH_METADATA_TXN.clone(),
-        ROTATE_AUTHENTICATION_KEY_TXN.clone(),
-        CREATE_ACCOUNT_TXN.clone(),
-    ]
-    .into_iter()
-    .map(|s| *HashValue::from_sha3_256(&s).as_ref())
-    .collect()
-}
-
-pub fn default_config() -> VMConfig {
-    VMConfig {
-        publishing_options: VMPublishingOption::Locked(HashSet::from_iter(
-            allowing_script_hashes().into_iter(),
-        )),
-    }
+    StdlibScript::try_from(code).map_or("<unknown transaction>".to_string(), |name| {
+        format!("{}_transaction", name)
+    })
 }

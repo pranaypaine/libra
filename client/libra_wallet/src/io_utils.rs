@@ -4,8 +4,8 @@
 //! A module to generate, store and load known users accounts.
 //! The concept of known users can be helpful for testing to provide reproducible results.
 
-use crate::*;
-use failure::prelude::*;
+use crate::{mnemonic::Mnemonic, wallet_library::WalletLibrary};
+use anyhow::{ensure, Result};
 use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -38,7 +38,7 @@ pub fn write_recovery<P: AsRef<Path>>(wallet: &WalletLibrary, path: &P) -> Resul
     writeln!(
         output,
         "{}{}{}",
-        wallet.mnemonic().to_string(),
+        wallet.mnemonic(),
         DELIMITER,
         wallet.key_leaf()
     )?;

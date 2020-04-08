@@ -3,9 +3,13 @@
 
 #![forbid(unsafe_code)]
 
-use failure::prelude::*;
-use libra_crypto::{ed25519::*, test_utils::KeyPair};
-use libra_tools::tempdir::TempPath;
+use anyhow::Result;
+use libra_crypto::{
+    ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
+    test_utils::KeyPair,
+    Uniform,
+};
+use libra_temppath::TempPath;
 use rand::{rngs::OsRng, Rng, SeedableRng};
 use std::{
     fs::{self, File},
@@ -23,7 +27,7 @@ pub fn create_faucet_key_file(output_file: &str) -> KeyPair<Ed25519PrivateKey, E
     let mut seed_rng = OsRng::new().expect("can't access OsRng");
     let mut rng = rand::rngs::StdRng::from_seed(seed_rng.gen());
 
-    let (private_key, _) = compat::generate_keypair(&mut rng);
+    let private_key = Ed25519PrivateKey::generate(&mut rng);
     let keypair = KeyPair::from(private_key);
 
     // Write to disk
@@ -56,7 +60,7 @@ pub fn load_faucet_key_or_create_default(
     // isn't one, then create a temp directory and generate the keypair
     if let Some(faucet_account_file) = file_path {
         match load_key_from_file(faucet_account_file.clone()) {
-            Ok(keypair) => (keypair, faucet_account_file.to_string(), None),
+            Ok(keypair) => (keypair, faucet_account_file, None),
             Err(e) => {
                 panic!(
                     "Unable to read faucet account file: {}, {}",
@@ -81,5 +85,22 @@ pub fn load_faucet_key_or_create_default(
             faucet_key_file_path,
             Some(tmp_dir),
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn verify_test_create_and_load_key() {
+        // Create key pair and file
+        let (key_pair, key_file_path, _handle) = load_faucet_key_or_create_default(None);
+
+        // Load previously created key from file
+        let (loaded_key_pair, _, _) = load_faucet_key_or_create_default(Some(key_file_path));
+
+        // Compare loaded key with created key
+        assert_eq!(key_pair, loaded_key_pair);
     }
 }

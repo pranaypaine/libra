@@ -1,19 +1,17 @@
-resource "aws_s3_bucket_object" "fullnode_peers" {
-  bucket = aws_s3_bucket.config.id
-  key    = "fullnode_peers.config.toml"
-  source = "${var.validator_set}/fn/network_peers.config.toml"
-  etag   = filemd5("${var.validator_set}/fn/network_peers.config.toml")
+locals {
+  total_num_fullnodes = var.num_fullnodes * var.num_fullnode_networks
+  fullnode_command    = var.log_to_file ? jsonencode(["bash", "-c", "/docker-run-dynamic-fullnode.sh >> /opt/libra/data/libra.log 2>&1"]) : jsonencode(["bash", "-c", "/docker-run-dynamic-fullnode.sh"])
 }
 
 resource "aws_instance" "fullnode" {
-  count         = var.num_fullnodes
+  count         = local.total_num_fullnodes
   ami           = local.aws_ecs_ami
   instance_type = var.validator_type
   subnet_id = element(
     aws_subnet.testnet.*.id,
     count.index % length(data.aws_availability_zones.available.names),
   )
-  depends_on                  = [aws_main_route_table_association.testnet, aws_iam_role_policy_attachment.ecs_extra]
+  depends_on                  = [aws_main_route_table_association.testnet, aws_iam_role_policy.ecs_extra]
   vpc_security_group_ids      = [aws_security_group.validator.id]
   associate_public_ip_address = local.instance_public_ip
   key_name                    = aws_key_pair.libra.key_name
@@ -21,7 +19,7 @@ resource "aws_instance" "fullnode" {
   user_data                   = local.user_data
 
   dynamic "root_block_device" {
-    for_each = contains(local.ebs_types, split(var.validator_type, ".")[0]) ? [0] : []
+    for_each = contains(local.ebs_types, split(".", var.validator_type)[0]) ? [0] : []
     content {
       volume_type = "io1"
       volume_size = var.validator_ebs_size
@@ -30,80 +28,47 @@ resource "aws_instance" "fullnode" {
   }
 
   tags = {
-    Name      = "${terraform.workspace}-fullnode-${substr(var.fullnode_ids[count.index], 0, 8)}"
-    Role      = "fullnode"
-    Workspace = terraform.workspace
-    PeerId    = var.fullnode_ids[count.index]
+    Name          = "${terraform.workspace}-fullnode-${count.index}"
+    Role          = "fullnode"
+    Workspace     = terraform.workspace
+    FullnodeIndex = count.index
   }
 
 }
 
-data "local_file" "fullnode_keys" {
-  count    = var.num_fullnodes
-  filename = "${var.validator_set}/fn/${var.fullnode_ids[count.index]}.node.network.keys.toml"
-}
-
-resource "aws_secretsmanager_secret" "fullnode_network" {
-  count                   = var.num_fullnodes
-  name                    = "${terraform.workspace}-fullnode-${substr(var.fullnode_ids[count.index], 0, 8)}"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "fullnode_network" {
-  count         = var.num_fullnodes
-  secret_id     = element(aws_secretsmanager_secret.fullnode_network.*.id, count.index)
-  secret_string = element(data.local_file.fullnode_keys.*.content, count.index)
-}
-
-data "template_file" "fullnode_config" {
-  count    = var.num_fullnodes
-  template = file("${var.validator_set}/fn/node.config.toml")
-
-  vars = {
-    self_ip = element(aws_instance.fullnode.*.private_ip, count.index)
-    peer_id = var.fullnode_ids[count.index]
-    upstream_peer = var.validator_fullnode_id[local.fullnode_list[count.index]]
-  }
-}
-
-data "template_file" "fullnode_seeds" {
-  count    = var.num_fullnodes
-  template = file("templates/seed_peers.config.toml")
-
-  vars = {
-    validators = "${var.validator_fullnode_id[local.fullnode_list[count.index]]}:${element(aws_instance.validator.*.private_ip, local.fullnode_list[count.index])}"
-    port       = 6181
-  }
-}
 
 data "template_file" "fullnode_ecs_task_definition" {
-  count    = var.num_fullnodes
-  template = file("templates/validator.json")
+  count    = local.total_num_fullnodes
+  template = file("templates/fullnode.json")
 
   vars = {
-    image            = local.image_repo
-    image_version    = local.image_version
-    cpu              = local.cpu_by_instance[var.validator_type]
-    mem              = local.mem_by_instance[var.validator_type]
-    node_config      = jsonencode(element(data.template_file.fullnode_config.*.rendered, count.index))
-    seed_peers       = jsonencode(element(data.template_file.fullnode_seeds.*.rendered, count.index))
-    genesis_blob     = jsonencode(filebase64("${var.validator_set}/genesis.blob"))
-    peer_id          = var.fullnode_ids[count.index]
-    network_secret   = element(aws_secretsmanager_secret.fullnode_network.*.arn, count.index)
-    consensus_secret = ""
-    fullnode_secret  = ""
-    log_level        = var.validator_log_level
-    log_group        = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
-    log_region       = var.region
-    log_prefix       = "fullnode-${substr(var.fullnode_ids[count.index], 0, 8)}"
-    capabilities     = jsonencode(var.validator_linux_capabilities)
-    command          = local.validator_command
+    image         = local.image_repo
+    image_version = local.image_version
+    cpu           = local.cpu_by_instance[var.validator_type]
+    mem           = local.mem_by_instance[var.validator_type]
+
+    cfg_listen_addr    = element(aws_instance.fullnode.*.private_ip, count.index)
+    cfg_num_validators = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
+    cfg_seed           = var.config_seed
+
+    cfg_seed_peer_ip   = element(aws_instance.validator.*.private_ip, count.index % var.num_fullnode_networks)
+    cfg_fullnode_index = (count.index % var.num_fullnodes)
+    cfg_num_fullnodes  = var.num_fullnodes
+    cfg_fullnode_seed  = var.fullnode_seed
+
+    fullnode_id  = count.index
+    log_level    = var.validator_log_level
+    log_group    = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
+    log_region   = var.region
+    log_prefix   = "fullnode-${count.index}"
+    capabilities = jsonencode(var.validator_linux_capabilities)
+    command      = local.fullnode_command
   }
 }
 
 resource "aws_ecs_task_definition" "fullnode" {
-  count  = var.num_fullnodes
-  family = "${terraform.workspace}-fullnode-${substr(var.fullnode_ids[count.index], 0, 8)}"
+  count  = local.total_num_fullnodes
+  family = "${terraform.workspace}-fullnode-${count.index}"
   container_definitions = element(
     data.template_file.fullnode_ecs_task_definition.*.rendered,
     count.index,
@@ -113,27 +78,7 @@ resource "aws_ecs_task_definition" "fullnode" {
 
   volume {
     name      = "libra-data"
-    host_path = "/data/libra"
-  }
-
-  volume {
-    name      = "consensus-peers"
-    host_path = "/opt/libra/consensus_peers.config.toml"
-  }
-
-  volume {
-    name      = "network-peers"
-    host_path = "/opt/libra/network_peers.config.toml"
-  }
-
-  volume {
-    name      = "fullnode-peers"
-    host_path = "/opt/libra/fullnode_peers.config.toml"
-  }
-
-  volume {
-    name      = "genesis-blob"
-    host_path = "/opt/libra/genesis.blob"
+    host_path = var.persist_libra_data ? "/data/libra" : ""
   }
 
   placement_constraints {
@@ -142,23 +87,23 @@ resource "aws_ecs_task_definition" "fullnode" {
   }
 
   tags = {
-    PeerId    = "${substr(var.fullnode_ids[count.index], 0, 8)}"
-    Role      = "validator"
-    Workspace = terraform.workspace
+    FullnodeId = count.index
+    Role       = "fullnode"
+    Workspace  = terraform.workspace
   }
 }
 
 resource "aws_ecs_service" "fullnode" {
-  count                              = var.num_fullnodes
-  name                               = "${terraform.workspace}-fullnode-${substr(var.fullnode_ids[count.index], 0, 8)}"
+  count                              = local.total_num_fullnodes
+  name                               = "${terraform.workspace}-fullnode-${count.index}"
   cluster                            = aws_ecs_cluster.testnet.id
   task_definition                    = element(aws_ecs_task_definition.fullnode.*.arn, count.index)
   desired_count                      = 1
   deployment_minimum_healthy_percent = 0
 
   tags = {
-    PeerId    = "${substr(var.fullnode_ids[count.index], 0, 8)}"
-    Role      = "fullnode"
-    Workspace = terraform.workspace
+    FullnodeId = count.index
+    Role       = "fullnode"
+    Workspace  = terraform.workspace
   }
 }

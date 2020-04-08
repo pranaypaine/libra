@@ -3,23 +3,23 @@ error:
    ┌── tests/move_check/naming/unresolved_type_no_args.move:2:22 ───
    │
  2 │     struct Mine { f: A }
-   │                      ^ Could not resolve type name: 'A'
-   │
-
-error: 
-
-   ┌── tests/move_check/naming/unresolved_type_no_args.move:3:12 ───
-   │
- 3 │     foo(x: S): G {
-   │            ^ Could not resolve type name: 'S'
+   │                      ^ Unbound type 'A' in current scope
    │
 
 error: 
 
    ┌── tests/move_check/naming/unresolved_type_no_args.move:3:16 ───
    │
- 3 │     foo(x: S): G {
-   │                ^ Could not resolve type name: 'G'
+ 3 │     fun foo(x: S): G {
+   │                ^ Unbound type 'S' in current scope
+   │
+
+error: 
+
+   ┌── tests/move_check/naming/unresolved_type_no_args.move:3:20 ───
+   │
+ 3 │     fun foo(x: S): G {
+   │                    ^ Unbound type 'G' in current scope
    │
 
 error: 
@@ -27,7 +27,7 @@ error:
    ┌── tests/move_check/naming/unresolved_type_no_args.move:4:16 ───
    │
  4 │         let _: B = (0: P);
-   │                ^ Could not resolve type name: 'B'
+   │                ^ Unbound type 'B' in current scope
    │
 
 error: 
@@ -35,6 +35,6 @@ error:
    ┌── tests/move_check/naming/unresolved_type_no_args.move:4:24 ───
    │
  4 │         let _: B = (0: P);
-   │                        ^ Could not resolve type name: 'P'
+   │                        ^ Unbound type 'P' in current scope
    │
 

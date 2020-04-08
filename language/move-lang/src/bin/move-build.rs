@@ -3,8 +3,10 @@
 
 #![forbid(unsafe_code)]
 
-use move_lang::command_line::{self as cli};
-use move_lang::shared::*;
+use move_lang::{
+    command_line::{self as cli},
+    shared::*,
+};
 use structopt::*;
 
 #[derive(Debug, StructOpt)]
@@ -15,18 +17,16 @@ pub struct Options {
         name = "PATH_TO_SOURCE_FILE",
         short = cli::SOURCE_FILES_SHORT,
         long = cli::SOURCE_FILES,
-        parse(from_str = cli::leak_str)
     )]
-    pub source_files: Vec<&'static str>,
+    pub source_files: Vec<String>,
 
     /// The library files needed as dependencies
     #[structopt(
         name = "PATH_TO_DEPENDENCY_FILE",
         short = cli::DEPENDENCIES_SHORT,
         long = cli::DEPENDENCIES,
-        parse(from_str = cli::leak_str)
     )]
-    pub dependencies: Vec<&'static str>,
+    pub dependencies: Vec<String>,
 
     /// The sender address for modules and scripts
     #[structopt(

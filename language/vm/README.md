@@ -36,7 +36,6 @@ utilities related to the file format:
   on-chain binary representation of the code.
 * Some pretty printing functionalities.
 * A proptest infrastructure for the file format.
-* The gas cost/synthesis infrastructure.
 
 The `CompiledModule` and `CompiledScript` definitions in
 `libra/language/vm/src/file_format.rs` are the top-level structs for a Move
@@ -49,9 +48,7 @@ simple abstraction over the file format. Additionally, a set of
 
 ```
 .
-├── cost-synthesis  # Infrastructure for gas cost synthesis
 ├── src             # VM core files
 ├── tests           # Proptests
-├── vm-genesis      # Helpers to generate a genesis block, the initial state of the blockchain
 └── vm-runtime      # Interpreter and runtime data types (see README in that folder)
 ```

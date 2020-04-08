@@ -1,0 +1,92 @@
+[admission_control]
+address = "0.0.0.0:8000"
+need_to_check_mempool_before_validation = false
+max_concurrent_inbound_syncs = 100
+
+[admission_control.upstream_proxy_timeout]
+secs = 1
+nanos = 0
+
+[base]
+data_dir = "/opt/libra/data/common"
+role = "validator"
+
+[consensus]
+max_block_size = 1000
+max_pruned_blocks_in_mem = 10000
+pacemaker_initial_timeout_ms = 1000
+contiguous_rounds = 2
+
+[consensus.proposer_type]
+type = "leader_reputation"
+active_weights = 99
+inactive_weights = 1
+[consensus.safety_rules.backend]
+type = "in_memory_storage"
+
+[debug_interface]
+admission_control_node_debug_port = 6191
+metrics_server_port = 9101
+public_metrics_server_port = 9102
+address = "0.0.0.0"
+
+[execution]
+genesis_file_location = ""
+
+[logger]
+is_async = true
+chan_size = 256
+level = "INFO"
+
+[metrics]
+collection_interval_ms = 1000
+dir = "metrics"
+enabled = false
+
+[mempool]
+broadcast_transactions = true
+shared_mempool_tick_interval_ms = 50
+shared_mempool_batch_size = 100
+shared_mempool_max_concurrent_inbound_syncs = 100
+capacity = 1000000
+capacity_per_user = 100
+system_transaction_timeout_secs = 86400
+system_transaction_gc_interval_ms = 180000
+
+[state_sync]
+chunk_limit = 250
+tick_interval_ms = 100
+long_poll_timeout_ms = 30000
+max_chunk_limit = 1000
+max_timeout_ms = 120000
+upstream_peers = []
+
+[storage]
+address = "127.0.0.1:6184"
+dir = "libradb/db"
+grpc_max_receive_len = 100000000
+
+[test.account_keypair]
+private_key = "a9ccbb14534fa25b8e2c8062f82592ca4a6ecd228895ef48a21faf480f4fdb9f"
+public_key = "8a09af25da4e547c7192a0f7f05c2b8db94af316a5b599bd2cff8797c28ae68b"
+[test.consensus_keypair]
+private_key = "87572b6c1ac0bc9f5245d04f7963c35db0713f0f08685f038d55f8c22a5c45b9"
+public_key = "7fb83ee67e2b16f89510cdd7c061b32a482d68465d24df70acc65b074b3f7862"
+
+[validator_network]
+peer_id = "afd41847853f81de4b37cd030195b25a"
+listen_address = "/ip4/0.0.0.0/tcp/6180"
+advertised_address = "/ip4/127.0.0.1/tcp/6180"
+discovery_interval_ms = 1000
+connectivity_check_interval_ms = 5000
+enable_noise = true
+enable_remote_authentication = true
+network_peers_file = ""
+seed_peers_file = "afd41847853f81de4b37cd030195b25a.seed_peers.toml"
+
+[validator_network.network_keypairs.signing_keys]
+private_key = "55f8f8956dde49b412e105460193381bf3fca57565a8a096e60ac7bdd6a0953f"
+public_key = "f5c974b9ead1ca6a6d5d93eb3bd5906e2b7cf5f710c8a7c86c8c6e918f42c4b1"
+[validator_network.network_keypairs.identity_keys]
+private_key = "70389b2e9483015d869e620ec46209f1e84b5f94b2339f6d327e0508cd5e3857"
+public_key = "c73d4a865295534a9440275892a0dbcf346c633e7bf3ea7933ed50f4b478030c"

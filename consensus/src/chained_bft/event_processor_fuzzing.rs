@@ -11,26 +11,28 @@ use crate::{
             rotating_proposer_election::RotatingProposer,
         },
         network::NetworkSender,
-        persistent_storage::{PersistentStorage, RecoveryData},
+        network_interface::ConsensusNetworkSender,
+        persistent_liveness_storage::{PersistentLivenessStorage, RecoveryData},
         test_utils::{EmptyStateComputer, MockStorage, MockTransactionManager, TestPayload},
     },
     util::mock_time_service::SimulatedTimeService,
 };
-use consensus_types::proposal_msg::{ProposalMsg, ProposalUncheckedSignatures};
+use channel::{self, libra_channel, message_queues::QueueStyle};
+use consensus_types::proposal_msg::ProposalMsg;
 use futures::{channel::mpsc, executor::block_on};
-use lazy_static::lazy_static;
-use libra_prost_ext::MessageExt;
-use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorSigner, ValidatorVerifier};
-use network::{proto::Proposal, validator_network::ConsensusNetworkSender};
-use prost::Message as _;
-use safety_rules::{InMemoryStorage, SafetyRules};
-use std::convert::TryFrom;
-use std::sync::Arc;
+use libra_types::{
+    ledger_info::LedgerInfoWithSignatures, validator_signer::ValidatorSigner,
+    validator_verifier::ValidatorVerifier,
+};
+use network::peer_manager::{ConnectionRequestSender, PeerManagerRequestSender};
+use once_cell::sync::Lazy;
+use safety_rules::{PersistentSafetyStorage, SafetyRules};
+use std::{num::NonZeroUsize, sync::Arc};
 use tokio::runtime::Runtime;
 
 // This generates a proposal for round 1
 pub fn generate_corpus_proposal() -> Vec<u8> {
-    let event_processor = create_node_for_fuzzing();
+    let mut event_processor = create_node_for_fuzzing();
     block_on(async {
         let proposal = event_processor
             .generate_proposal(NewRoundEvent {
@@ -40,34 +42,27 @@ pub fn generate_corpus_proposal() -> Vec<u8> {
             })
             .await;
         // serialize and return proposal
-        let proposal = proposal.unwrap();
-        Proposal::try_from(proposal)
-            .unwrap()
-            .to_bytes()
-            .unwrap()
-            .to_vec()
+        lcs::to_bytes(&proposal.unwrap()).unwrap()
     })
 }
 
 // optimization for the fuzzer
-lazy_static! {
-    static ref STATIC_RUNTIME: Runtime = Runtime::new().unwrap();
-    static ref FUZZING_SIGNER: ValidatorSigner = ValidatorSigner::from_int(1);
-}
+static STATIC_RUNTIME: Lazy<Runtime> = Lazy::new(|| Runtime::new().unwrap());
+static FUZZING_SIGNER: Lazy<ValidatorSigner> = Lazy::new(|| ValidatorSigner::from_int(1));
 
 // helpers
 fn build_empty_store(
-    storage: Arc<dyn PersistentStorage<TestPayload>>,
+    storage: Arc<dyn PersistentLivenessStorage<TestPayload>>,
     initial_data: RecoveryData<TestPayload>,
 ) -> Arc<BlockStore<TestPayload>> {
     let (_commit_cb_sender, _commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
 
-    Arc::new(block_on(BlockStore::new(
+    Arc::new(BlockStore::new(
         storage,
         initial_data,
         Arc::new(EmptyStateComputer),
         10, // max pruned blocks in mem
-    )))
+    ))
 }
 
 // TODO: MockStorage -> EmptyStorage
@@ -86,26 +81,37 @@ fn create_node_for_fuzzing() -> EventProcessor<TestPayload> {
 
     // TODO: remove
     let validator = ValidatorVerifier::new_single(signer.author(), signer.public_key());
+    let validator_set = (&validator).into();
 
     // TODO: EmptyStorage
-    let (initial_data, storage) = MockStorage::<TestPayload>::start_for_testing(validator);
+    let (initial_data, storage) = MockStorage::<TestPayload>::start_for_testing(validator_set);
 
     // TODO: remove
-    let safety_rules =
-        SafetyRules::new(InMemoryStorage::default_storage(), Arc::new(signer.clone()));
+    let safety_rules = SafetyRules::new(
+        signer.author(),
+        PersistentSafetyStorage::in_memory(signer.private_key().clone()),
+    );
 
     // TODO: mock channels
-    let (network_reqs_tx, _network_reqs_rx) = channel::new_test(8);
-    let network_sender = ConsensusNetworkSender::new(network_reqs_tx);
+    let (network_reqs_tx, _network_reqs_rx) =
+        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+    let (connection_reqs_tx, _) =
+        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+    let (conn_mgr_reqs_tx, _conn_mgr_reqs_rx) = channel::new_test(8);
+    let network_sender = ConsensusNetworkSender::new(
+        PeerManagerRequestSender::new(network_reqs_tx),
+        ConnectionRequestSender::new(connection_reqs_tx),
+        conn_mgr_reqs_tx,
+    );
     let (self_sender, _self_receiver) = channel::new_test(8);
+
+    let epoch_info = initial_data.epoch_info();
     let network = NetworkSender::new(
         signer.author(),
         network_sender,
         self_sender,
-        initial_data.validators(),
+        epoch_info.verifier.clone(),
     );
-
-    let validators = initial_data.validators();
 
     // TODO: mock
     let block_store = build_empty_store(storage.clone(), initial_data);
@@ -117,7 +123,7 @@ fn create_node_for_fuzzing() -> EventProcessor<TestPayload> {
     let proposal_generator = ProposalGenerator::new(
         signer.author(),
         block_store.clone(),
-        Arc::new(MockTransactionManager::new()),
+        Box::new(MockTransactionManager::new(None)),
         time_service.clone(),
         1,
     );
@@ -130,17 +136,17 @@ fn create_node_for_fuzzing() -> EventProcessor<TestPayload> {
 
     // event processor
     EventProcessor::new(
+        epoch_info,
         Arc::clone(&block_store),
         None,
         pacemaker,
         proposer_election,
         proposal_generator,
-        safety_rules,
-        Arc::new(MockTransactionManager::new()),
+        Box::new(safety_rules),
         network,
-        storage.clone(),
+        Box::new(MockTransactionManager::new(None)),
+        storage,
         time_service,
-        validators,
     )
 }
 
@@ -149,7 +155,7 @@ pub fn fuzz_proposal(data: &[u8]) {
     // create node
     let mut event_processor = create_node_for_fuzzing();
 
-    let proposal = match Proposal::decode(data) {
+    let proposal: ProposalMsg<TestPayload> = match lcs::from_bytes(data) {
         Ok(xx) => xx,
         Err(_) => {
             if cfg!(test) {
@@ -158,21 +164,9 @@ pub fn fuzz_proposal(data: &[u8]) {
             return;
         }
     };
-
-    let proposal = match ProposalUncheckedSignatures::<TestPayload>::try_from(proposal) {
-        Ok(xx) => xx,
-        Err(_) => {
-            if cfg!(test) {
-                panic!();
-            }
-            return;
-        }
-    };
-
-    let proposal: ProposalMsg<TestPayload> = proposal.into();
 
     let proposal = match proposal.verify_well_formed() {
-        Ok(xx) => xx,
+        Ok(_) => proposal,
         Err(_) => {
             if cfg!(test) {
                 panic!();

@@ -3,11 +3,15 @@
 
 mod state;
 
-use super::{absint::*, ast::*};
-use crate::shared::unique_map::UniqueMap;
-use crate::{errors::*, parser::ast::Var, shared::*};
+use super::absint::*;
+use crate::{
+    errors::*,
+    hlir::ast::*,
+    parser::ast::{BinOp_, StructName, Var},
+    shared::unique_map::UniqueMap,
+};
 use state::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 //**************************************************************************************************
 // Entry and trait bindings
@@ -55,7 +59,13 @@ impl<'a, 'b> Context<'a, 'b> {
 impl TransferFunctions for BorrowSafety {
     type State = BorrowState;
 
-    fn execute(&mut self, pre: &mut Self::State, cmd: &Command) -> Errors {
+    fn execute(
+        &mut self,
+        pre: &mut Self::State,
+        _lbl: Label,
+        _idx: usize,
+        cmd: &Command,
+    ) -> Errors {
         let mut context = Context::new(self, pre);
         command(&mut context, cmd);
         context
@@ -70,14 +80,17 @@ impl AbstractInterpreter for BorrowSafety {}
 pub fn verify(
     errors: &mut Errors,
     signature: &FunctionSignature,
+    acquires: &BTreeSet<StructName>,
     locals: &UniqueMap<Var, SingleType>,
     cfg: &super::cfg::BlockCFG,
-) {
-    let mut initial_state = BorrowState::initial(locals);
+) -> BTreeMap<Label, BorrowState> {
+    let mut initial_state = BorrowState::initial(locals, acquires.clone(), !errors.is_empty());
     initial_state.bind_arguments(&signature.parameters);
     let mut safety = BorrowSafety::new(locals);
     initial_state.canonicalize_locals(&safety.local_numbers);
-    errors.append(&mut safety.analyze_function(cfg, initial_state));
+    let (final_state, mut es) = safety.analyze_function(cfg, initial_state);
+    errors.append(&mut es);
+    final_state
 }
 
 //**************************************************************************************************
@@ -118,6 +131,7 @@ fn command(context: &mut Context, sp!(loc, cmd_): &Command) {
             context.borrow_state.abort()
         }
         C::Jump(_) => (),
+        C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
     }
 }
 
@@ -140,7 +154,9 @@ fn lvalue(context: &mut Context, sp!(loc, l_): &LValue, value: Value) {
         }
         L::Unpack(_, _, fields) => {
             assert!(!value.is_ref());
-            fields.iter().for_each(|(_, l)| lvalue(context, l, value))
+            fields
+                .iter()
+                .for_each(|(_, l)| lvalue(context, l, Value::NonRef))
         }
     }
 }
@@ -225,17 +241,30 @@ fn exp(context: &mut Context, parent_e: &Exp) -> Values {
             values
         }
 
-        E::Unit | E::Value(_) | E::UnresolvedError => svalue(),
-        E::UnaryExp(_, e) => {
+        E::Unit | E::Value(_) | E::Spec(_, _) | E::UnresolvedError => svalue(),
+        E::Cast(e, _) | E::UnaryExp(_, e) => {
             let v = exp(context, e);
             assert!(!assert_single_value(v).is_ref());
             svalue()
         }
+        E::BinopExp(e1, sp!(_, BinOp_::Eq), e2) | E::BinopExp(e1, sp!(_, BinOp_::Neq), e2) => {
+            let v1 = assert_single_value(exp(context, e1));
+            let v2 = assert_single_value(exp(context, e2));
+            if v1.is_ref() {
+                // derefrence releases the id and checks that it is readable
+                assert!(v2.is_ref());
+                let (errors, _) = context.borrow_state.dereference(e1.exp.loc, v1);
+                assert!(errors.is_empty(), "ICE eq freezing failed");
+                let (errors, _) = context.borrow_state.dereference(e1.exp.loc, v2);
+                assert!(errors.is_empty(), "ICE eq freezing failed");
+            }
+            svalue()
+        }
         E::BinopExp(e1, _, e2) => {
-            let v1 = exp(context, e1);
-            let v2 = exp(context, e2);
-            context.borrow_state.release_values(v1);
-            context.borrow_state.release_values(v2);
+            let v1 = assert_single_value(exp(context, e1));
+            let v2 = assert_single_value(exp(context, e2));
+            assert!(!v1.is_ref());
+            assert!(!v2.is_ref());
             svalue()
         }
         E::Pack(_, _, fields) => {
@@ -250,6 +279,8 @@ fn exp(context: &mut Context, parent_e: &Exp) -> Values {
             .iter()
             .flat_map(|item| exp_list_item(context, item))
             .collect(),
+
+        E::Unreachable => panic!("ICE should not analyze dead code"),
     }
 }
 

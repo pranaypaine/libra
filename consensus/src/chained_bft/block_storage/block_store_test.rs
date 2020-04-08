@@ -1,10 +1,11 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::chained_bft::test_utils::build_simple_tree;
 use crate::chained_bft::{
-    block_storage::{block_store::sync_manager::NeedFetchResult, BlockReader, VoteReceptionResult},
-    test_utils::{build_empty_tree, TreeInserter},
+    block_storage::{
+        block_store::sync_manager::NeedFetchResult, BlockReader, PendingVotes, VoteReceptionResult,
+    },
+    test_utils::{build_empty_tree, build_simple_tree, TreeInserter},
 };
 use consensus_types::{
     block::{
@@ -18,10 +19,11 @@ use consensus_types::{
     vote::Vote,
     vote_data::VoteData,
 };
-use futures::executor::block_on;
 use libra_crypto::{HashValue, PrivateKey};
-use libra_types::crypto_proxies::random_validator_verifier;
-use libra_types::{account_address::AccountAddress, crypto_proxies::ValidatorSigner};
+use libra_types::{
+    account_address::AccountAddress, validator_signer::ValidatorSigner,
+    validator_verifier::random_validator_verifier,
+};
 use proptest::prelude::*;
 use std::{cmp::min, collections::HashSet};
 
@@ -116,7 +118,7 @@ proptest! {
                 let known_parent = block_store.block_exists(block.parent_id());
                 let certified_parent = block.quorum_cert().certified_block().id() == block.parent_id();
                 let verify_res = block.verify_well_formed();
-                let res = block_on(block_store.execute_and_insert_block(block.clone()));
+                let res = block_store.execute_and_insert_block(block.clone());
                 if !certified_parent {
                     prop_assert!(verify_res.is_err());
                 } else if !known_parent {
@@ -236,7 +238,7 @@ fn test_path_from_root() {
 
     assert_eq!(
         block_store.path_from_root(b3.id()),
-        Some(vec![b1.clone(), b2.clone(), b3.clone()])
+        Some(vec![b1, b2.clone(), b3.clone()])
     );
     assert_eq!(block_store.path_from_root(genesis.id()), Some(vec![]));
 
@@ -248,7 +250,7 @@ fn test_path_from_root() {
 
 #[test]
 fn test_insert_vote() {
-    ::libra_logger::try_init_for_testing();
+    ::libra_logger::Logger::new().environment_only(true).init();
     // Set up enough different authors to support different votes for the same block.
     let (signers, validator_verifier) = random_validator_verifier(11, Some(10), false);
     let my_signer = signers[10].clone();
@@ -256,17 +258,16 @@ fn test_insert_vote() {
     let block_store = inserter.block_store();
     let genesis = block_store.root();
     let block = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
+    let mut pending_votes = PendingVotes::new();
 
     assert!(block_store.get_quorum_cert_for_block(block.id()).is_none());
     for (i, voter) in signers.iter().enumerate().take(10).skip(1) {
-        let executed_state = &block.compute_result().executed_state;
-
         let vote = Vote::new(
             VoteData::new(
                 block.block().gen_block_info(
-                    executed_state.state_id,
-                    executed_state.version,
-                    executed_state.validators.clone(),
+                    block.compute_result().root_hash(),
+                    block.compute_result().version(),
+                    block.compute_result().validators().clone(),
                 ),
                 block.quorum_cert().certified_block().clone(),
             ),
@@ -274,13 +275,13 @@ fn test_insert_vote() {
             placeholder_ledger_info(),
             voter,
         );
-        let vote_res = block_store.insert_vote_and_qc(&vote, &validator_verifier);
+        let vote_res = pending_votes.insert_vote(&vote, &validator_verifier);
 
         // first vote of an author is accepted
         assert_eq!(vote_res, VoteReceptionResult::VoteAdded(i as u64));
         // filter out duplicates
         assert_eq!(
-            block_store.insert_vote_and_qc(&vote, &validator_verifier),
+            pending_votes.insert_vote(&vote, &validator_verifier),
             VoteReceptionResult::DuplicateVote,
         );
         // qc is still not there
@@ -288,14 +289,13 @@ fn test_insert_vote() {
     }
 
     // Add the final vote to form a QC
-    let executed_state = &block.compute_result().executed_state;
     let final_voter = &signers[0];
     let vote = Vote::new(
         VoteData::new(
             block.block().gen_block_info(
-                executed_state.state_id,
-                executed_state.version,
-                executed_state.validators.clone(),
+                block.compute_result().root_hash(),
+                block.compute_result().version(),
+                block.compute_result().validators().clone(),
             ),
             block.quorum_cert().certified_block().clone(),
         ),
@@ -303,9 +303,12 @@ fn test_insert_vote() {
         placeholder_ledger_info(),
         final_voter,
     );
-    match block_store.insert_vote_and_qc(&vote, &validator_verifier) {
+    match pending_votes.insert_vote(&vote, &validator_verifier) {
         VoteReceptionResult::NewQuorumCertificate(qc) => {
             assert_eq!(qc.certified_block().id(), block.id());
+            block_store
+                .insert_single_quorum_cert(qc.as_ref().clone())
+                .unwrap();
         }
         _ => {
             panic!("QC not formed!");
@@ -329,7 +332,7 @@ fn test_illegal_timestamp() {
         certificate_for_genesis(),
         &signer,
     );
-    let result = block_on(block_store.execute_and_insert_block(block_with_illegal_timestamp));
+    let result = block_store.execute_and_insert_block(block_with_illegal_timestamp);
     assert!(result.is_err());
 }
 
@@ -342,11 +345,11 @@ fn test_highest_qc() {
     // genesis <- a1 <- a2 <- a3
     let genesis = block_store.root();
     let a1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
-    assert_eq!(block_store.highest_certified_block(), genesis.clone());
+    assert_eq!(block_store.highest_certified_block(), genesis);
     let a2 = inserter.insert_block(&a1, 2, None);
-    assert_eq!(block_store.highest_certified_block(), a1.clone());
+    assert_eq!(block_store.highest_certified_block(), a1);
     let _a3 = inserter.insert_block(&a2, 3, None);
-    assert_eq!(block_store.highest_certified_block(), a2.clone());
+    assert_eq!(block_store.highest_certified_block(), a2);
 }
 
 #[test]
@@ -367,7 +370,6 @@ fn test_need_fetch_for_qc() {
         a3.round() + 1,
         HashValue::zero(),
         a3.round(),
-        None,
     );
     let too_old_qc = certificate_for_genesis();
     let can_insert_qc = placeholder_certificate_for_block(
@@ -376,7 +378,6 @@ fn test_need_fetch_for_qc() {
         a3.round(),
         a2.id(),
         a2.round(),
-        None,
     );
     let duplicate_qc = block_store.get_quorum_cert_for_block(a2.id()).unwrap();
     assert_eq!(
@@ -407,24 +408,30 @@ fn test_empty_reconfiguration_suffix() {
     let a3 = inserter.insert_reconfiguration_block(&a2, 3);
     let a4 = inserter.create_block_with_qc(
         inserter.create_qc_for_block(a3.as_ref(), None),
-        a3.as_ref(),
+        a3.as_ref().timestamp_usecs(),
         4,
         vec![42],
     );
     // Child of reconfiguration carries a payload will fail to insert
-    assert!(block_on(block_store.execute_and_insert_block(a4)).is_err());
+    assert!(a4.verify_well_formed().is_err());
     let a5 = inserter.create_block_with_qc(
         inserter.create_qc_for_block(a3.as_ref(), None),
-        a3.as_ref(),
+        a3.as_ref().timestamp_usecs(),
         4,
         vec![],
     );
     // Child of reconfiguration doesn't carry payload will succeed and roll over the validator set
-    let a5 = block_on(block_store.execute_and_insert_block(a5)).unwrap();
+    let a5 = block_store.execute_and_insert_block(a5).unwrap();
     assert!(a5.compute_result().has_reconfiguration());
     // Block continues another branch can carry payload
     inserter.insert_block(&a2, 4, None);
     block_store.prune_tree(a3.id());
-    // If reconfiguration is committed, the child block can carry payload
-    let _a6 = inserter.insert_block(&a3, 4, None);
+    // If reconfiguration is committed, the child block will fail to insert
+    let a6 = inserter.create_block_with_qc(
+        inserter.create_qc_for_block(a5.as_ref(), None),
+        a5.as_ref().timestamp_usecs(),
+        5,
+        vec![42],
+    );
+    assert!(a6.verify_well_formed().is_err());
 }

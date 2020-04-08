@@ -1,7 +1,7 @@
 module M {
-    foo() {
-        .global_borrow();
-        .release<u64>();
-        .sudo(false);
+    fun foo() {
+        ::global_borrow();
+        ::release<u64>();
+        ::sudo(false);
     }
 }

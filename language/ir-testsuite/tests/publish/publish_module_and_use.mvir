@@ -1,0 +1,47 @@
+module MoneyHolder {
+        import 0x0.LBR;
+        import 0x0.Libra;
+
+        resource T { money: Libra.T<LBR.T> }
+
+        public new(m: Libra.T<LBR.T>): Self.T {
+            return T{ money: move(m) };
+        }
+
+        public value(this :&Self.T): u64 {
+            let ref: &Libra.T<LBR.T>;
+            let val: u64;
+            ref = &copy(this).money;
+            val = Libra.value<LBR.T>(move(ref));
+            _ = move(this);
+            return move(val);
+        }
+
+        public destroy_t(t: Self.T) {
+            let money: Libra.T<LBR.T>;
+            T{ money } = move(t);
+            Libra.destroy_zero<LBR.T>(move(money));
+            return;
+        }
+}
+
+//! new-transaction
+
+import {{default}}.MoneyHolder;
+import 0x0.LBR;
+import 0x0.Libra;
+
+main() {
+    let coin: Libra.T<LBR.T>;
+    let money_holder: MoneyHolder.T;
+    let money_holder_ref: &MoneyHolder.T;
+    let value: u64;
+    coin = Libra.zero<LBR.T>();
+    money_holder = MoneyHolder.new(move(coin));
+    money_holder_ref = &money_holder;
+    value = MoneyHolder.value(move(money_holder_ref));
+    assert(copy(value) == 0, 42);
+    MoneyHolder.destroy_t(move(money_holder));
+
+    return;
+}

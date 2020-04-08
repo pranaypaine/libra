@@ -1,8 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use failure::Result;
 use schemadb::{
     define_schema,
     schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec},
@@ -71,13 +71,13 @@ fn collect_values(iter: SchemaIterator<TestSchema>) -> Vec<u32> {
 }
 
 struct TestDB {
-    _tmpdir: libra_tools::tempdir::TempPath,
+    _tmpdir: libra_temppath::TempPath,
     db: DB,
 }
 
 impl TestDB {
     fn new() -> Self {
-        let tmpdir = libra_tools::tempdir::TempPath::new();
+        let tmpdir = libra_temppath::TempPath::new();
         let cf_opts_map: ColumnFamilyOptionsMap = [
             (DEFAULT_CF_NAME, ColumnFamilyOptions::default()),
             (
@@ -134,7 +134,7 @@ impl std::ops::Deref for TestDB {
 fn test_seek_to_first() {
     let db = TestDB::new();
     let mut iter = db.iter();
-    iter.seek_to_first();
+    iter.seek_to_first().unwrap();
     assert_eq!(
         collect_values(iter),
         [100, 102, 104, 110, 112, 114, 200, 202]
@@ -145,7 +145,7 @@ fn test_seek_to_first() {
 fn test_seek_to_last() {
     let db = TestDB::new();
     let mut iter = db.iter();
-    iter.seek_to_last();
+    iter.seek_to_last().unwrap();
     assert_eq!(collect_values(iter), [202]);
 }
 

@@ -79,6 +79,15 @@ resource "aws_security_group_rule" "monitoring-prometheus" {
   ipv6_cidr_blocks  = var.ssh_sources_ipv6
 }
 
+resource "aws_security_group_rule" "monitoring-pushgateway" {
+  security_group_id        = aws_security_group.monitoring.id
+  type                     = "ingress"
+  from_port                = 9092
+  to_port                  = 9092
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.validator.id
+}
+
 resource "aws_security_group_rule" "monitoring-egress" {
   security_group_id = aws_security_group.monitoring.id
   type              = "egress"
@@ -122,6 +131,49 @@ resource "aws_security_group_rule" "validator-ac" {
   to_port           = 8001
   protocol          = "tcp"
   cidr_blocks       = concat(var.api_sources_ipv4, [aws_vpc.testnet.cidr_block])
+}
+
+resource "aws_security_group_rule" "validator-jsonrpc" {
+  security_group_id = aws_security_group.validator.id
+  type              = "ingress"
+  from_port         = 8080
+  to_port           = 8080
+  protocol          = "tcp"
+  cidr_blocks       = [aws_vpc.testnet.cidr_block]
+}
+
+resource "aws_security_group" "jsonrpc-lb" {
+  name        = "${terraform.workspace}-jsonrpc-lb"
+  description = "jsonrpc-lb"
+  vpc_id      = aws_vpc.testnet.id
+}
+
+resource "aws_security_group_rule" "json-rpc" {
+  security_group_id = aws_security_group.jsonrpc-lb.id
+  type              = "ingress"
+  from_port         = 80
+  to_port           = 80
+  protocol          = "tcp"
+  cidr_blocks       = concat(var.api_sources_ipv4, [aws_vpc.testnet.cidr_block])
+}
+
+resource "aws_security_group_rule" "json-rpc-https" {
+  security_group_id = aws_security_group.jsonrpc-lb.id
+  type              = "ingress"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  cidr_blocks       = concat(var.api_sources_ipv4, [aws_vpc.testnet.cidr_block])
+}
+
+resource "aws_security_group_rule" "jsonrpc-lb-egress" {
+  security_group_id = aws_security_group.jsonrpc-lb.id
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  ipv6_cidr_blocks  = ["::/0"]
 }
 
 resource "aws_security_group_rule" "validator-host-mon" {
@@ -212,4 +264,57 @@ resource "aws_security_group_rule" "faucet-lb-application" {
   to_port           = 80
   protocol          = "tcp"
   cidr_blocks       = var.api_sources_ipv4
+}
+
+resource "aws_security_group" "vault" {
+  name        = "${terraform.workspace}-vault"
+  description = "Vault secrets manager"
+  vpc_id      = aws_vpc.testnet.id
+}
+
+resource "aws_security_group_rule" "vault-validator" {
+  security_group_id        = aws_security_group.vault.id
+  type                     = "ingress"
+  from_port                = 8200
+  to_port                  = 8200
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.validator.id
+}
+
+resource "aws_security_group_rule" "vault-ssh" {
+  security_group_id = aws_security_group.vault.id
+  type              = "ingress"
+  from_port         = 22
+  to_port           = 22
+  protocol          = "tcp"
+  cidr_blocks       = var.ssh_sources_ipv4
+  ipv6_cidr_blocks  = var.ssh_sources_ipv6
+}
+
+resource "aws_security_group_rule" "vault-mon-host" {
+  security_group_id        = aws_security_group.vault.id
+  type                     = "ingress"
+  from_port                = 9100
+  to_port                  = 9100
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.monitoring.id
+}
+
+resource "aws_security_group_rule" "vault-mon-vault" {
+  security_group_id        = aws_security_group.vault.id
+  type                     = "ingress"
+  from_port                = 8200
+  to_port                  = 8200
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.monitoring.id
+}
+
+resource "aws_security_group_rule" "vault-egress" {
+  security_group_id = aws_security_group.vault.id
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = -1
+  cidr_blocks       = ["0.0.0.0/0"]
+  ipv6_cidr_blocks  = ["::/0"]
 }

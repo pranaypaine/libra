@@ -22,13 +22,12 @@ def create_client():
         ac_hosts = os.environ['AC_HOST'].split(',')
         ac_host = random.choice(ac_hosts)
         ac_port = os.environ['AC_PORT']
+        url = "http://{}:{}".format(ac_host, ac_port)
 
-        print("Connecting to ac on: {}:{}".format(ac_host, ac_port))
-        cmd = "/opt/libra/bin/client --host {} --port {} -m {} -s {}".format(
-            ac_host,
-            ac_port,
-            "/opt/libra/etc/mint.key",
-            "/opt/libra/etc/consensus_peers.config.toml")
+        print("Connecting to ac on: {}".format(url))
+        cmd = "/opt/libra/bin/cli --url {} -m {}".format(
+            url,
+            "/opt/libra/etc/mint.key")
 
         application.client = pexpect.spawn(cmd)
         application.client.delaybeforesend = 0.1
@@ -43,11 +42,11 @@ create_client()
 
 @application.route("/", methods=('POST',))
 def send_transaction():
-    address = flask.request.args['address']
+    auth_key = flask.request.args['auth_key']
 
-    # Return immediately if address is invalid
-    if re.match('^[a-f0-9]{64}$', address) is None:
-        return 'Malformed address', 400
+    # Return immediately if auth_key is invalid
+    if re.match('^[a-f0-9]{64}$', auth_key) is None:
+        return 'Malformed auth_key', 400
 
     try:
         amount = decimal.Decimal(flask.request.args['amount'])
@@ -60,11 +59,12 @@ def send_transaction():
     try:
         create_client()
         application.client.sendline(
-            "a m {} {}".format(address, amount / (10 ** 6)))
+            "a m {} {}".format(auth_key, amount / (10 ** 6)))
         application.client.expect("Mint request submitted", timeout=2)
 
         application.client.sendline("a la")
         application.client.expect(r"sequence_number: ([0-9]+)", timeout=1)
+        application.client.terminate(True)
     except pexpect.exceptions.ExceptionPexpect:
         application.client.terminate(True)
         raise

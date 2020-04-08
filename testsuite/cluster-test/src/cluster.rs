@@ -4,20 +4,26 @@
 #![forbid(unsafe_code)]
 
 use crate::{aws::Aws, instance::Instance};
-use failure::{self, prelude::*};
-use libra_config::config::AdmissionControlConfig;
+use anyhow::{ensure, format_err, Result};
+use config_builder::ValidatorConfig;
+use generate_keypair::load_key_from_file;
+use libra_config::config::DEFAULT_JSON_RPC_PORT;
+use libra_crypto::{
+    ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
+    test_utils::KeyPair,
+};
+use libra_logger::*;
 use rand::prelude::*;
 use rusoto_ec2::{DescribeInstancesRequest, Ec2, Filter, Tag};
-use slog_scope::*;
-use std::collections::HashMap;
-use std::{thread, time::Duration};
+use std::{collections::HashMap, convert::TryInto, thread, time::Duration};
 
 #[derive(Clone)]
 pub struct Cluster {
     // guaranteed non-empty
-    instances: Vec<Instance>,
+    validator_instances: Vec<Instance>,
+    fullnode_instances: Vec<Instance>,
     prometheus_ip: Option<String>,
-    mint_file: String,
+    mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
 }
 
 impl Cluster {
@@ -32,15 +38,39 @@ impl Cluster {
                 )
             })
             .collect();
+        let mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> =
+            load_key_from_file(mint_file).expect("invalid faucet keypair file");
         Self {
-            instances,
+            validator_instances: instances,
+            fullnode_instances: vec![],
             prometheus_ip: None,
-            mint_file: mint_file.to_string(),
+            mint_key_pair,
         }
     }
 
-    pub fn discover(aws: &Aws, mint_file: &str) -> failure::Result<Self> {
-        let mut instances = vec![];
+    fn get_mint_key_pair() -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
+        let seed = "1337133713371337133713371337133713371337133713371337133713371337";
+        let seed = hex::decode(seed).expect("Invalid hex in seed.");
+        let seed = seed[..32].try_into().expect("Invalid seed");
+        let mint_key = ValidatorConfig::new().seed(seed).build_faucet_client();
+        KeyPair::from(mint_key)
+    }
+
+    pub fn new_k8s(
+        validator_instances: Vec<Instance>,
+        fullnode_instances: Vec<Instance>,
+    ) -> Result<Self> {
+        Ok(Self {
+            validator_instances,
+            fullnode_instances,
+            prometheus_ip: None,
+            mint_key_pair: Self::get_mint_key_pair(),
+        })
+    }
+
+    pub fn discover(aws: &Aws) -> Result<Self> {
+        let mut validator_instances = vec![];
+        let mut fullnode_instances = vec![];
         let mut next_token = None;
         let mut retries_left = 10;
         let mut prometheus_ip: Option<String> = None;
@@ -48,7 +78,7 @@ impl Cluster {
             let filters = vec![
                 Filter {
                     name: Some("tag:Workspace".into()),
-                    values: Some(vec![aws.workplace().clone()]),
+                    values: Some(vec![aws.workspace().clone()]),
                 },
                 Filter {
                     name: Some("instance-state-name".into()),
@@ -80,7 +110,7 @@ impl Cluster {
                 }
                 Ok(r) => r,
             };
-            let ac_port = AdmissionControlConfig::default().admission_control_service_port as u32;
+            let ac_port = DEFAULT_JSON_RPC_PORT as u32;
             for reservation in result.reservations.expect("no reservations") {
                 for aws_instance in reservation.instances.expect("no instances") {
                     let ip = aws_instance
@@ -92,9 +122,11 @@ impl Cluster {
                         InstanceRole::Prometheus => {
                             prometheus_ip = Some(ip);
                         }
-                        InstanceRole::Peer(peer_id) => {
-                            let short_hash = peer_id[..8].into();
-                            instances.push(Instance::new(short_hash, ip, ac_port));
+                        InstanceRole::Validator(peer_name) => {
+                            validator_instances.push(Instance::new(peer_name, ip, ac_port));
+                        }
+                        InstanceRole::Fullnode(peer_name) => {
+                            fullnode_instances.push(Instance::new(peer_name, ip, ac_port));
                         }
                         _ => {}
                     }
@@ -106,43 +138,58 @@ impl Cluster {
             }
         }
         ensure!(
-            !instances.is_empty(),
+            !validator_instances.is_empty(),
             "No instances were discovered for cluster"
         );
         let prometheus_ip =
-            prometheus_ip.ok_or_else(|| format_err!("Prometheus was not found in workplace"))?;
+            prometheus_ip.ok_or_else(|| format_err!("Prometheus was not found in workspace"))?;
+        let mint_key_pair = Self::get_mint_key_pair();
         Ok(Self {
-            instances,
+            validator_instances,
+            fullnode_instances,
             prometheus_ip: Some(prometheus_ip),
-            mint_file: mint_file.to_string(),
+            mint_key_pair,
         })
     }
 
-    pub fn random_instance(&self) -> Instance {
+    pub fn random_validator_instance(&self) -> Instance {
         let mut rnd = rand::thread_rng();
-        self.instances.choose(&mut rnd).unwrap().clone()
+        self.validator_instances.choose(&mut rnd).unwrap().clone()
     }
 
-    pub fn instances(&self) -> &Vec<Instance> {
-        &self.instances
+    pub fn validator_instances(&self) -> &[Instance] {
+        &self.validator_instances
+    }
+    pub fn fullnode_instances(&self) -> &[Instance] {
+        &self.fullnode_instances
     }
 
-    pub fn into_instances(self) -> Vec<Instance> {
-        self.instances
+    pub fn all_instances(&self) -> impl Iterator<Item = &Instance> {
+        self.validator_instances
+            .iter()
+            .chain(self.fullnode_instances.iter())
+    }
+
+    pub fn into_validator_instances(self) -> Vec<Instance> {
+        self.validator_instances
+    }
+
+    pub fn into_fullnode_instances(self) -> Vec<Instance> {
+        self.fullnode_instances
     }
 
     pub fn prometheus_ip(&self) -> Option<&String> {
         self.prometheus_ip.as_ref()
     }
 
-    pub fn mint_file(&self) -> &str {
-        &self.mint_file
+    pub fn mint_key_pair(&self) -> &KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
+        &self.mint_key_pair
     }
 
-    pub fn get_instance(&self, name: &str) -> Option<&Instance> {
-        self.instances
+    pub fn get_validator_instance(&self, name: &str) -> Option<&Instance> {
+        self.validator_instances
             .iter()
-            .find(|instance| instance.short_hash() == name)
+            .find(|instance| instance.peer_name() == name)
     }
 
     /// Splits this cluster into two
@@ -150,38 +197,67 @@ impl Cluster {
     /// Returns tuple of two clusters:
     /// First element in tuple contains cluster with c random instances from self
     /// Second element in tuple contains cluster with remaining instances from self
-    pub fn split_n_random(&self, c: usize) -> (Self, Self) {
-        assert!(c <= self.instances.len());
+    pub fn split_n_validators_random(&self, c: usize) -> (Self, Self) {
+        assert!(c <= self.validator_instances.len());
         let mut rng = ThreadRng::default();
         let mut sub = vec![];
-        let mut rem = self.instances.clone();
+        let mut rem = self.validator_instances.clone();
         for _ in 0..c {
             let idx_remove = rng.gen_range(0, rem.len());
             let instance = rem.remove(idx_remove);
             sub.push(instance);
         }
-        (self.new_sub_cluster(sub), self.new_sub_cluster(rem))
+        (
+            self.new_validator_sub_cluster(sub),
+            self.new_validator_sub_cluster(rem),
+        )
     }
 
-    fn new_sub_cluster(&self, instances: Vec<Instance>) -> Self {
+    pub fn split_n_fullnodes_random(&self, c: usize) -> (Self, Self) {
+        assert!(c <= self.fullnode_instances.len());
+        let mut rng = ThreadRng::default();
+        let mut sub = vec![];
+        let mut rem = self.fullnode_instances.clone();
+        for _ in 0..c {
+            let idx_remove = rng.gen_range(0, rem.len());
+            let instance = rem.remove(idx_remove);
+            sub.push(instance);
+        }
+        (
+            self.new_fullnode_sub_cluster(sub),
+            self.new_fullnode_sub_cluster(rem),
+        )
+    }
+
+    fn new_validator_sub_cluster(&self, instances: Vec<Instance>) -> Self {
         Cluster {
-            instances,
+            validator_instances: instances,
+            fullnode_instances: vec![],
             prometheus_ip: self.prometheus_ip.clone(),
-            mint_file: self.mint_file.clone(),
+            mint_key_pair: self.mint_key_pair.clone(),
         }
     }
 
-    pub fn sub_cluster(&self, ids: Vec<String>) -> Cluster {
+    fn new_fullnode_sub_cluster(&self, instances: Vec<Instance>) -> Self {
+        Cluster {
+            validator_instances: vec![],
+            fullnode_instances: instances,
+            prometheus_ip: self.prometheus_ip.clone(),
+            mint_key_pair: self.mint_key_pair.clone(),
+        }
+    }
+
+    pub fn validator_sub_cluster(&self, ids: Vec<String>) -> Cluster {
         let mut instances = Vec::with_capacity(ids.len());
         for id in ids {
-            let instance = self.get_instance(&id);
+            let instance = self.get_validator_instance(&id);
             match instance {
                 Some(instance) => instances.push(instance.clone()),
                 None => panic!("Can not make sub_cluster: instance {} is not found", id),
             }
         }
         assert!(!instances.is_empty(), "No instances for subcluster");
-        self.new_sub_cluster(instances)
+        self.new_validator_sub_cluster(instances)
     }
 }
 
@@ -189,10 +265,15 @@ fn parse_tags(tags: Vec<Tag>) -> InstanceRole {
     let mut map: HashMap<_, _> = tags.into_iter().map(|tag| (tag.key, tag.value)).collect();
     let role = map.remove(&Some("Role".to_string()));
     if role == Some(Some("validator".to_string())) {
-        let peer_id = map.remove(&Some("PeerId".to_string()));
-        let peer_id = peer_id.expect("Validator instance without PeerId");
-        let peer_id = peer_id.expect("PeerId tag without value");
-        return InstanceRole::Peer(peer_id);
+        let peer_name = map.remove(&Some("Name".to_string()));
+        let peer_name = peer_name.expect("Validator instance without Name");
+        let peer_name = peer_name.expect("'Name' tag without value");
+        return InstanceRole::Validator(peer_name);
+    } else if role == Some(Some("fullnode".to_string())) {
+        let peer_name = map.remove(&Some("Name".to_string()));
+        let peer_name = peer_name.expect("Fullnode instance without Name");
+        let peer_name = peer_name.expect("'Name' tag without value");
+        return InstanceRole::Fullnode(peer_name);
     } else if role == Some(Some("monitoring".to_string())) {
         return InstanceRole::Prometheus;
     }
@@ -200,7 +281,8 @@ fn parse_tags(tags: Vec<Tag>) -> InstanceRole {
 }
 
 enum InstanceRole {
-    Peer(String),
+    Validator(String),
+    Fullnode(String),
     Prometheus,
     Unknown,
 }

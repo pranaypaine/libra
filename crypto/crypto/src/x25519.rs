@@ -43,7 +43,7 @@
 //! use libra_crypto::Uniform;
 //! let seed = [1u8; 32];
 //! let mut rng: StdRng = SeedableRng::from_seed(seed);
-//! let private_key = X25519StaticPrivateKey::generate_for_testing(&mut rng);
+//! let private_key = X25519StaticPrivateKey::generate(&mut rng);
 //! let public_key: X25519StaticPublicKey = (&private_key).into();
 //!
 //! // Generate an X25519 key pair from an RNG and a user-provided seed.
@@ -57,12 +57,10 @@
 //! ```
 
 use crate::{hkdf::Hkdf, traits::*};
-use libra_crypto_derive::{Deref, SilentDebug, SilentDisplay};
+use libra_crypto_derive::{Deref, DeserializeKey, SerializeKey, SilentDebug, SilentDisplay};
 use rand::{rngs::EntropyRng, RngCore};
-use serde::{de, ser};
 use sha2::Sha256;
-use std::{convert::TryFrom, fmt, ops::Deref};
-use x25519_dalek;
+use std::{convert::TryFrom, ops::Deref};
 
 /// TODO: move traits to the right file (possibly traits.rs)
 
@@ -81,16 +79,16 @@ pub const X25519_PRIVATE_KEY_LENGTH: usize = 32;
 pub struct X25519EphemeralPrivateKey(x25519_dalek::EphemeralSecret);
 
 /// An x25519 static private (secret) key
-#[derive(SilentDisplay, SilentDebug, Clone)]
+#[derive(Clone, DeserializeKey, SilentDisplay, SilentDebug, SerializeKey)]
 pub struct X25519StaticPrivateKey(x25519_dalek::StaticSecret);
 
 /// An x25519 public key
-#[derive(Clone, Debug, Deref)]
+#[derive(Clone, Deref)]
 pub struct X25519PublicKey(x25519_dalek::PublicKey);
 
 /// An x25519 public key to match the X25519Static key type, which
 /// dereferences to an X25519PublicKey
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, DeserializeKey, Eq, Hash, PartialEq, SerializeKey)]
 pub struct X25519StaticPublicKey(X25519PublicKey);
 
 /// An x25519 shared key
@@ -102,7 +100,7 @@ pub struct X25519SharedKey(x25519_dalek::SharedSecret);
 /////////////////////////
 
 impl Uniform for X25519EphemeralPrivateKey {
-    fn generate_for_testing<R>(rng: &mut R) -> Self
+    fn generate<R>(rng: &mut R) -> Self
     where
         R: ::rand::SeedableRng + ::rand::RngCore + ::rand::CryptoRng,
     {
@@ -183,7 +181,7 @@ impl X25519StaticPrivateKey {
 }
 
 impl Uniform for X25519StaticPrivateKey {
-    fn generate_for_testing<R>(rng: &mut R) -> Self
+    fn generate<R>(rng: &mut R) -> Self
     where
         R: ::rand::SeedableRng + ::rand::RngCore + ::rand::CryptoRng,
     {
@@ -223,6 +221,12 @@ impl TryFrom<&[u8]> for X25519StaticPrivateKey {
         Ok(X25519StaticPrivateKey(x25519_dalek::StaticSecret::from(
             bits,
         )))
+    }
+}
+
+impl Length for X25519StaticPrivateKey {
+    fn length(&self) -> usize {
+        X25519_PRIVATE_KEY_LENGTH
     }
 }
 
@@ -285,144 +289,52 @@ impl TryFrom<&[u8]> for X25519StaticPublicKey {
     }
 }
 
+impl Length for X25519StaticPublicKey {
+    fn length(&self) -> usize {
+        X25519_PUBLIC_KEY_LENGTH
+    }
+}
+
 impl ValidKey for X25519StaticPublicKey {
     fn to_bytes(&self) -> Vec<u8> {
         self.deref().0.as_bytes().to_vec()
     }
 }
 
-//////////////////////
-// SharedKey Traits //
-//////////////////////
-
-//////////////////////////////
-// Compact Serialization    //
-//////////////////////////////
-
-impl ser::Serialize for X25519StaticPrivateKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: ser::Serializer,
-    {
-        serializer.serialize_bytes(&self.to_bytes())
+impl std::fmt::Display for X25519PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", hex::encode(&self.0.as_bytes()))
     }
 }
 
-impl ser::Serialize for X25519StaticPublicKey {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: ser::Serializer,
-    {
-        serializer.serialize_bytes(&self.to_bytes())
+impl std::fmt::Debug for X25519PublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "X25519PublicKey({})", self)
     }
 }
 
-struct X25519StaticPrivateKeyVisitor;
-struct X25519StaticPublicKeyVisitor;
-
-impl<'de> de::Visitor<'de> for X25519StaticPrivateKeyVisitor {
-    type Value = X25519StaticPrivateKey;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("x25519_dalek static key in bytes")
-    }
-
-    fn visit_bytes<E>(self, value: &[u8]) -> Result<X25519StaticPrivateKey, E>
-    where
-        E: de::Error,
-    {
-        X25519StaticPrivateKey::try_from(value).map_err(E::custom)
+impl std::fmt::Display for X25519StaticPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", &self.0)
     }
 }
 
-impl<'de> de::Visitor<'de> for X25519StaticPublicKeyVisitor {
-    type Value = X25519StaticPublicKey;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("x25519_dalek public key in bytes")
-    }
-
-    fn visit_bytes<E>(self, value: &[u8]) -> Result<X25519StaticPublicKey, E>
-    where
-        E: de::Error,
-    {
-        X25519StaticPublicKey::try_from(value).map_err(E::custom)
+impl std::fmt::Debug for X25519StaticPublicKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "X25519StaticPublicKey({})", self)
     }
 }
 
-impl<'de> de::Deserialize<'de> for X25519StaticPrivateKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        deserializer.deserialize_bytes(X25519StaticPrivateKeyVisitor {})
-    }
-}
+#[cfg(any(test, feature = "fuzzing"))]
+use proptest::prelude::*;
 
-impl<'de> de::Deserialize<'de> for X25519StaticPublicKey {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        deserializer.deserialize_bytes(X25519StaticPublicKeyVisitor {})
-    }
-}
+#[cfg(any(test, feature = "fuzzing"))]
+impl proptest::arbitrary::Arbitrary for X25519StaticPublicKey {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
 
-//////////////////////////
-// Compatibility Traits //
-//////////////////////////
-
-/// Those transitory traits are meant to help with the progressive
-/// migration of the code base to the crypto module and will
-/// disappear after.
-pub mod compat {
-    use crate::traits::*;
-    #[cfg(any(test, feature = "fuzzing"))]
-    use proptest::strategy::LazyJust;
-    #[cfg(any(test, feature = "fuzzing"))]
-    use proptest::{prelude::*, strategy::Strategy};
-
-    use crate::x25519::{X25519StaticPrivateKey, X25519StaticPublicKey};
-    use rand::{rngs::StdRng, SeedableRng};
-
-    /// Generate an arbitrary key pair, with possible Rng input
-    ///
-    /// Warning: if you pass in None, this will not return distinct
-    /// results every time! Should you want to write non-deterministic
-    /// tests, look at libra_config::config_builder::util::get_test_config
-    pub fn generate_keypair<'a, T>(opt_rng: T) -> (X25519StaticPrivateKey, X25519StaticPublicKey)
-    where
-        T: Into<Option<&'a mut StdRng>> + Sized,
-    {
-        if let Some(rng_mut_ref) = opt_rng.into() {
-            <(X25519StaticPrivateKey, X25519StaticPublicKey)>::generate_for_testing(rng_mut_ref)
-        } else {
-            let mut rng = StdRng::from_seed(crate::test_utils::TEST_SEED);
-            <(X25519StaticPrivateKey, X25519StaticPublicKey)>::generate_for_testing(&mut rng)
-        }
-    }
-
-    /// Used to produce keypairs from a seed for testing purposes
-    #[cfg(any(test, feature = "fuzzing"))]
-    pub fn keypair_strategy(
-    ) -> impl Strategy<Value = (X25519StaticPrivateKey, X25519StaticPublicKey)> {
-        // The no_shrink is because keypairs should be fixed -- shrinking would cause a different
-        // keypair to be generated, which appears to not be very useful.
-        any::<[u8; 32]>()
-            .prop_map(|seed| {
-                let mut rng: StdRng = SeedableRng::from_seed(seed);
-                let (private_key, public_key) = generate_keypair(&mut rng);
-                (private_key, public_key)
-            })
-            .no_shrink()
-    }
-
-    #[cfg(any(test, feature = "fuzzing"))]
-    impl Arbitrary for X25519StaticPublicKey {
-        type Parameters = ();
-        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-            LazyJust::new(|| generate_keypair(None).1).boxed()
-        }
-        type Strategy = BoxedStrategy<Self>;
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        crate::test_utils::uniform_keypair_strategy::<X25519StaticPrivateKey, X25519StaticPublicKey>()
+            .prop_map(|v| v.public_key).boxed()
     }
 }

@@ -2,11 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{block::Block, common::Payload};
-use failure::prelude::*;
+use anyhow::ensure;
 use libra_crypto::hash::HashValue;
-use libra_types::crypto_proxies::ValidatorVerifier;
+use libra_types::validator_verifier::ValidatorVerifier;
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
 use std::fmt;
 
 /// RPC to get a chain of block of the given length starting from the given block id.
@@ -38,24 +37,6 @@ impl fmt::Display for BlockRetrievalRequest {
             "[BlockRetrievalRequest starting from id {} with {} blocks]",
             self.block_id, self.num_blocks
         )
-    }
-}
-
-impl TryFrom<network::proto::RequestBlock> for BlockRetrievalRequest {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::RequestBlock) -> failure::Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
-    }
-}
-
-impl TryFrom<BlockRetrievalRequest> for network::proto::RequestBlock {
-    type Error = failure::Error;
-
-    fn try_from(block_retrieval_request: BlockRetrievalRequest) -> failure::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&block_retrieval_request)?,
-        })
     }
 }
 
@@ -95,7 +76,7 @@ impl<T: Payload> BlockRetrievalResponse<T> {
         block_id: HashValue,
         num_blocks: u64,
         sig_verifier: &ValidatorVerifier,
-    ) -> failure::Result<()> {
+    ) -> anyhow::Result<()> {
         ensure!(
             self.status != BlockRetrievalStatus::Succeeded
                 || self.blocks.len() as u64 == num_blocks,
@@ -139,23 +120,5 @@ impl<T: Payload> fmt::Display for BlockRetrievalResponse<T> {
             }
             _ => write!(f, "[BlockRetrievalResponse: status: {:?}", self.status()),
         }
-    }
-}
-
-impl<T: Payload> TryFrom<network::proto::RespondBlock> for BlockRetrievalResponse<T> {
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::RespondBlock) -> failure::Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
-    }
-}
-
-impl<T: Payload> TryFrom<BlockRetrievalResponse<T>> for network::proto::RespondBlock {
-    type Error = failure::Error;
-
-    fn try_from(block_retrieval_response: BlockRetrievalResponse<T>) -> failure::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&block_retrieval_response)?,
-        })
     }
 }

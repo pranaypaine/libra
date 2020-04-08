@@ -4,8 +4,9 @@
 #![forbid(unsafe_code)]
 
 use crate::{effects::Effect, instance::Instance};
-use failure;
-use futures::future::{BoxFuture, FutureExt};
+use anyhow::Result;
+
+use async_trait::async_trait;
 use std::fmt;
 
 pub struct StopContainer {
@@ -18,19 +19,20 @@ impl StopContainer {
     }
 }
 
+#[async_trait]
 impl Effect for StopContainer {
-    fn activate(&self) -> BoxFuture<failure::Result<()>> {
+    async fn activate(&self) -> Result<()> {
         self.instance
             .run_cmd(vec!["sudo /usr/sbin/service docker stop"])
-            .boxed()
+            .await
     }
 
-    fn deactivate(&self) -> BoxFuture<failure::Result<()>> {
+    async fn deactivate(&self) -> Result<()> {
         self.instance
             .run_cmd(vec![
                 "sudo /usr/sbin/service docker start && sudo /usr/sbin/service ecs start",
             ])
-            .boxed()
+            .await
     }
 }
 

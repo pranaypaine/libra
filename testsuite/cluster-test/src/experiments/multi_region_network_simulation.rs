@@ -4,22 +4,28 @@
 #![forbid(unsafe_code)]
 use std::{fmt, time::Duration};
 
-use slog_scope::{info, warn};
+use anyhow::Result;
+use libra_logger::{info, warn};
 use structopt::StructOpt;
 
-use failure;
 use tokio::time;
 
 /// This module provides an experiment which simulates a multi-region environment.
 /// It undoes the simulation in the cluster after the given duration
 use crate::effects::Effect;
-use crate::effects::NetworkDelay;
-use crate::experiments::Context;
+use crate::{
+    effects::NetworkDelay,
+    experiments::{Context, ExperimentParam},
+};
 
-use crate::experiments::Experiment;
-use crate::tx_emitter::{EmitJobRequest, EmitThreadParams, TxEmitter};
-use crate::util::unix_timestamp_now;
-use futures::future::{join_all, BoxFuture, FutureExt};
+use crate::{
+    cluster::Cluster,
+    experiments::Experiment,
+    tx_emitter::{EmitJobRequest, TxEmitter},
+    util::unix_timestamp_now,
+};
+use async_trait::async_trait;
+use futures::future::join_all;
 
 #[derive(Default, Debug)]
 struct Metrics {
@@ -57,19 +63,25 @@ pub struct MultiRegionSimulationParams {
     duration_secs: u64,
 }
 
-impl MultiRegionSimulation {
-    pub fn new(params: MultiRegionSimulationParams) -> Self {
-        Self { params }
+impl ExperimentParam for MultiRegionSimulationParams {
+    type E = MultiRegionSimulation;
+    fn build(self, _cluster: &Cluster) -> Self::E {
+        Self::E { params: self }
     }
+}
 
-    async fn single_run(
-        &self,
+impl MultiRegionSimulation {
+    async fn single_run<'a>(
+        &'a self,
         count: usize,
         cross_region_delay: Duration,
-        context: &mut Context,
-    ) -> failure::Result<Metrics> {
-        let (cluster1, cluster2) = context.cluster.split_n_random(count);
-        let (region1, region2) = (cluster1.into_instances(), cluster2.into_instances());
+        context: &'a mut Context<'_>,
+    ) -> Result<Metrics> {
+        let (cluster1, cluster2) = context.cluster.split_n_validators_random(count);
+        let (region1, region2) = (
+            cluster1.into_validator_instances(),
+            cluster2.into_validator_instances(),
+        );
         let (smaller_region, larger_region);
         if region1.len() < region2.len() {
             smaller_region = &region1;
@@ -189,50 +201,45 @@ fn print_results(metrics: Vec<Metrics>) {
     }
 }
 
+#[async_trait]
 impl Experiment for MultiRegionSimulation {
-    fn run<'a>(
-        &'a mut self,
-        context: &'a mut Context,
-    ) -> BoxFuture<'a, failure::Result<Option<String>>> {
-        async move {
-            let mut emitter = TxEmitter::new(&context.cluster);
-            let mut results = vec![];
-            for split in &self.params.splits {
-                for cross_region_latency in &self.params.cross_region_latencies {
-                    let job = emitter
-                        .start_job(EmitJobRequest {
-                            instances: context.cluster.instances().clone(),
-                            accounts_per_client: 10,
-                            thread_params: EmitThreadParams::default(),
-                        })
-                        .expect("Failed to start emit job");
-                    // Wait for minting to complete and transactions to start
-                    time::delay_for(Duration::from_secs(30)).await;
-                    info!(
-                        "Running multi region simulation: split: {}, cross region latency: {}ms",
-                        split, cross_region_latency
-                    );
-                    if let Ok(metrics) = self
-                        .single_run(
-                            *split,
-                            Duration::from_millis(*cross_region_latency),
-                            context,
-                        )
-                        .await
-                        .map_err(|e| warn!("{}", e))
-                    {
-                        info!("metrics for this run: {:?}", metrics);
-                        results.push(metrics);
-                    }
-                    emitter.stop_job(job);
-                    // Sleep for a minute before different experiments
-                    time::delay_for(Duration::from_secs(60)).await;
+    async fn run(&mut self, context: &mut Context<'_>) -> anyhow::Result<()> {
+        let mut emitter = TxEmitter::new(&context.cluster);
+        let mut results = vec![];
+        for split in &self.params.splits {
+            for cross_region_latency in &self.params.cross_region_latencies {
+                let job = emitter
+                    .start_job(EmitJobRequest::for_instances(
+                        context.cluster.validator_instances().to_vec(),
+                        context.global_emit_job_request,
+                    ))
+                    .await
+                    .expect("Failed to start emit job");
+                // Wait for minting to complete and transactions to start
+                time::delay_for(Duration::from_secs(30)).await;
+                info!(
+                    "Running multi region simulation: split: {}, cross region latency: {}ms",
+                    split, cross_region_latency
+                );
+                if let Ok(metrics) = self
+                    .single_run(
+                        *split,
+                        Duration::from_millis(*cross_region_latency),
+                        context,
+                    )
+                    .await
+                    .map_err(|e| warn!("{}", e))
+                {
+                    info!("metrics for this run: {:?}", metrics);
+                    results.push(metrics);
                 }
+                emitter.stop_job(job);
+                // Sleep for a minute before different experiments
+                time::delay_for(Duration::from_secs(60)).await;
             }
-            print_results(results);
-            Ok(None)
         }
-            .boxed()
+        print_results(results);
+        Ok(())
     }
 
     fn deadline(&self) -> Duration {

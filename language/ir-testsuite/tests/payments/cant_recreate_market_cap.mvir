@@ -1,0 +1,11 @@
+import 0x0.LBR;
+
+main() {
+
+    // This will fail because the sender is not 0x0
+    LBR.initialize();
+
+    return;
+}
+
+// check: VMExecutionFailure

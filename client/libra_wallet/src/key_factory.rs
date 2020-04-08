@@ -15,17 +15,22 @@
 //! Note further that the Key Derivation Function (KDF) chosen in the derivation of Child
 //! Private Keys adheres to [HKDF RFC 5869](https://tools.ietf.org/html/rfc5869).
 
+use crate::mnemonic::Mnemonic;
+use anyhow::Result;
 use byteorder::{ByteOrder, LittleEndian};
 use hmac::Hmac;
-use libra_crypto::{ed25519::*, hash::HashValue, hkdf::Hkdf, traits::SigningKey};
-use libra_types::account_address::AccountAddress;
+use libra_crypto::{
+    ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature},
+    hash::HashValue,
+    hkdf::Hkdf,
+    traits::SigningKey,
+};
+use libra_types::{account_address::AccountAddress, transaction::authenticator::AuthenticationKey};
 use mirai_annotations::*;
 use pbkdf2::pbkdf2;
 use serde::{Deserialize, Serialize};
 use sha3::Sha3_256;
 use std::{convert::TryFrom, ops::AddAssign};
-
-use crate::{error::Result, mnemonic::Mnemonic};
 
 /// Master is a set of raw bytes that are used for child key derivation
 pub struct Master([u8; 32]);
@@ -94,13 +99,14 @@ impl ExtendedPrivKey {
         (&self.private_key).into()
     }
 
-    /// Computes the sha3 hash of the PublicKey and attempts to construct a Libra AccountAddress
-    /// from the raw bytes of the pubkey hash
-    pub fn get_address(&self) -> Result<AccountAddress> {
-        let public_key = self.get_public();
-        let hash = *HashValue::from_sha3_256(&public_key.to_bytes()).as_ref();
-        let addr = AccountAddress::try_from(&hash[..])?;
-        Ok(addr)
+    /// Compute the account address for this account's public key
+    pub fn get_address(&self) -> AccountAddress {
+        AccountAddress::from_public_key(&self.get_public())
+    }
+
+    /// Compute the authentication key for this account's public key
+    pub fn get_authentication_key(&self) -> AuthenticationKey {
+        AuthenticationKey::ed25519(&self.get_public())
     }
 
     /// Libra specific sign function that is capable of signing an arbitrary HashValue
@@ -159,13 +165,6 @@ impl KeyFactory {
 
 /// Seed is the output of a one-way function, which accepts a Mnemonic as input
 pub struct Seed([u8; 32]);
-
-impl Seed {
-    /// Get the underlying Seed internal data
-    pub fn data(&self) -> Vec<u8> {
-        self.0.to_vec()
-    }
-}
 
 impl Seed {
     /// This constructor implements the one-way function that allows to generate a Seed from a

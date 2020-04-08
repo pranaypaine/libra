@@ -1,12 +1,11 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
-use crate::block_info::BlockInfo;
 use crate::{
     account_address::AccountAddress,
+    account_config::lbr_type_tag,
     account_state_blob::AccountStateBlob,
+    block_info::BlockInfo,
     ledger_info::LedgerInfo,
     proof::{
         definition::MAX_ACCUMULATOR_PROOF_DEPTH, AccountStateProof, EventAccumulatorInternalNode,
@@ -18,12 +17,12 @@ use crate::{
     vm_error::StatusCode,
 };
 use libra_crypto::{
-    ed25519::*,
+    ed25519::Ed25519PrivateKey,
     hash::{
         CryptoHash, TestOnlyHash, ACCUMULATOR_PLACEHOLDER_HASH, GENESIS_BLOCK_ID,
         SPARSE_MERKLE_PLACEHOLDER_HASH,
     },
-    HashValue,
+    HashValue, PrivateKey, Uniform,
 };
 
 #[test]
@@ -337,14 +336,16 @@ fn test_verify_account_state_and_event() {
     let txn_info0_hash = b"hellohello".test_only_hash();
     let txn_info1_hash = b"worldworld".test_only_hash();
 
-    let (privkey, pubkey) = compat::generate_keypair(None);
+    let privkey = Ed25519PrivateKey::generate_for_testing();
+    let pubkey = privkey.public_key();
     let txn2_hash = Transaction::UserTransaction(
         RawTransaction::new_script(
             AccountAddress::from_public_key(&pubkey),
             /* sequence_number = */ 0,
-            Script::new(vec![], vec![]),
+            Script::new(vec![], vec![], vec![]),
             /* max_gas_amount = */ 0,
             /* gas_unit_price = */ 0,
+            /* gas_specifier = */ lbr_type_tag(),
             /* expiration_time = */ std::time::Duration::new(0, 0),
         )
         .sign(&privkey, pubkey)
@@ -424,8 +425,8 @@ fn test_verify_account_state_and_event() {
 
     let transaction_info_to_event_proof = EventAccumulatorProof::new(vec![event1_hash]);
     let event_proof = EventProof::new(
-        ledger_info_to_transaction_info_proof.clone(),
-        txn_info2.clone(),
+        ledger_info_to_transaction_info_proof,
+        txn_info2,
         transaction_info_to_event_proof,
     );
 

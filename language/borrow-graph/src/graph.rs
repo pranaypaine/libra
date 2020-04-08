@@ -1,8 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::paths::{self, Path, PathSlice};
-use crate::references::*;
+use crate::{
+    paths::{self, Path, PathSlice},
+    references::*,
+};
 use mirai_annotations::{debug_checked_postcondition, debug_checked_precondition};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -10,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // Definitions
 //**************************************************************************************************
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct BorrowGraph<Loc: Copy, Lbl: Clone + Ord>(BTreeMap<RefID, Ref<Loc, Lbl>>);
 
 //**************************************************************************************************
@@ -35,7 +37,7 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
         assert!(self.0.insert(id, Ref::new(mutable)).is_none(), "{}", id.0)
     }
 
-    /// Return the refrences borrowing the `id` reference
+    /// Return the references borrowing the `id` reference
     /// The borrows are collected by first label in the borrow edge
     /// `BTreeMap<RefID, Loc>` represents all of the "full" or "epsilon" borrows (non field borrows)
     /// `BTreeMap<Lbl, BTreeMap<RefID, Loc>>)` represents the field borrows, collected over the
@@ -102,6 +104,7 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
     }
 
     fn add_edge(&mut self, parent_id: RefID, edge: BorrowEdge<Loc, Lbl>, child_id: RefID) {
+        assert!(parent_id != child_id);
         let parent = self.0.get_mut(&parent_id).unwrap();
         parent
             .borrowed_by
@@ -221,6 +224,11 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
         child_id: RefID,
         intermediate_to_child: &BorrowEdge<Loc, Lbl>,
     ) {
+        // dont add in an edge if releasing from a cycle
+        if parent_id == child_id {
+            return;
+        }
+
         let path = if parent_to_intermediate.strong {
             paths::append(&parent_to_intermediate.path, &intermediate_to_child.path)
         } else {
@@ -257,6 +265,7 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
                         })
                         .unwrap_or(false);
                     if !found_match {
+                        assert!(parent_id != child_id);
                         unmatched_edges
                             .entry(*parent_id)
                             .or_insert_with(BorrowEdges::new)
@@ -320,7 +329,7 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
     //**********************************************************************************************
 
     fn check_invariant(&self) -> bool {
-        self.id_consistency() && self.edge_consistency()
+        self.id_consistency() && self.edge_consistency() && self.no_self_loops()
     }
 
     /// Checks at all ids in edges are contained in the borrow map itself, i.e. that each id
@@ -348,6 +357,14 @@ impl<Loc: Copy, Lbl: Clone + Ord> BorrowGraph<Loc, Lbl> {
                 && r.borrows_from
                     .iter()
                     .all(|p| child_to_parent_consistency(id, p))
+        })
+    }
+
+    /// Checks that no reference borrows from itself
+    fn no_self_loops(&self) -> bool {
+        self.0.iter().all(|(id, r)| {
+            r.borrowed_by.0.keys().all(|to_id| id != to_id)
+                && r.borrows_from.iter().all(|from_id| id != from_id)
         })
     }
 

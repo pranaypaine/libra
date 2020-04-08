@@ -1,0 +1,18 @@
+module M {
+    resource R { f:bool }
+    t0() {
+        let r: Self.R;
+        let f: bool;
+        r = R{ f: false };
+        if (true) {
+            R{ f: f } = move(r);
+        } else {
+            R{ f: f } = move(r);
+            r = R{ f: false };
+        }
+        R{ f: f } = move(r);
+        return;
+    }
+}
+
+// check: JOIN_FAILURE

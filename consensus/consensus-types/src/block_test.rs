@@ -1,13 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::block::block_test_utils::certificate_for_genesis;
 use crate::{
-    block::{block_test_utils::*, Block},
+    block::{
+        block_test_utils::{certificate_for_genesis, *},
+        Block,
+    },
     quorum_cert::QuorumCert,
 };
 use libra_crypto::hash::{CryptoHash, HashValue};
-use libra_types::crypto_proxies::{ValidatorSigner, ValidatorVerifier};
+use libra_types::{validator_signer::ValidatorSigner, validator_verifier::ValidatorVerifier};
 use std::{collections::BTreeMap, panic, sync::Arc};
 
 #[test]
@@ -30,10 +32,7 @@ fn test_nil_block() {
         genesis_block.id()
     );
     assert_eq!(nil_block.round(), 1);
-    assert_eq!(
-        nil_block.timestamp_usecs(),
-        genesis_block.timestamp_usecs() + 1
-    );
+    assert_eq!(nil_block.timestamp_usecs(), genesis_block.timestamp_usecs());
     assert_eq!(nil_block.is_nil_block(), true);
     assert!(nil_block.author().is_none());
 
@@ -65,7 +64,7 @@ fn test_nil_block() {
         payload,
         2,
         get_current_timestamp().as_micros() as u64,
-        nil_block_qc.clone(),
+        nil_block_qc,
         &signer,
     );
     assert_eq!(nil_block_child.is_nil_block(), false);
@@ -116,9 +115,7 @@ fn test_same_qc_different_authors() {
         &signer,
     );
 
-    let signature = signer
-        .sign_message(genesis_qc.ledger_info().ledger_info().hash())
-        .expect("Signing a hash should succeed");
+    let signature = signer.sign_message(genesis_qc.ledger_info().ledger_info().hash());
     let mut ledger_info_altered = genesis_qc.ledger_info().clone();
     ledger_info_altered.add_signature(signer.author(), signature);
     let genesis_qc_altered = QuorumCert::new(genesis_qc.vote_data().clone(), ledger_info_altered);

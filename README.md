@@ -6,6 +6,7 @@
 
 [![CircleCI](https://circleci.com/gh/libra/libra.svg?style=shield)](https://circleci.com/gh/libra/libra)
 [![License](https://img.shields.io/badge/license-Apache-green.svg)](LICENSE)
+[![codecov](https://codecov.io/gh/libra/libra/branch/master/graph/badge.svg)](https://codecov.io/gh/libra/libra)
 
 Libra Core implements a decentralized, programmable database which provides a financial infrastructure that can empower billions of people.
 
@@ -16,7 +17,7 @@ Libra Core implements a decentralized, programmable database which provides a fi
 
 ## Contributing
 
-Read our [Contributing guide](https://developers.libra.org/docs/community/contributing). Find out what’s coming on our [blog](https://developers.libra.org/blog/2019/06/18/the-path-forward).
+To begin contributing, [sign the CLA](https://libra.org/en-US/cla-sign/). You can learn more about contributing to the Libra project by reading our [Contribution Guide](https://developers.libra.org/docs/community/contributing) and by viewing our [Code of Conduct](https://developers.libra.org/docs/policies/code-of-conduct).
 
 ## Getting Started
 

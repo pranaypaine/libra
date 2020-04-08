@@ -14,12 +14,14 @@ use crate::{
     OP_COUNTERS,
 };
 use chrono::Utc;
+use debug_interface::prelude::*;
 use libra_config::config::NodeConfig;
 use libra_logger::prelude::*;
-use libra_mempool_shared_proto::{
-    proto::mempool_status::MempoolAddTransactionStatusCode, MempoolAddTransactionStatus,
+use libra_types::{
+    account_address::AccountAddress,
+    mempool_status::{MempoolStatus, MempoolStatusCode},
+    transaction::SignedTransaction,
 };
-use libra_types::{account_address::AccountAddress, transaction::SignedTransaction};
 use lru_cache::LruCache;
 use std::{cmp::max, collections::HashSet, convert::TryFrom};
 use ttl_cache::TtlCache;
@@ -38,7 +40,7 @@ pub struct Mempool {
 }
 
 impl Mempool {
-    pub(crate) fn new(config: &NodeConfig) -> Self {
+    pub fn new(config: &NodeConfig) -> Self {
         Mempool {
             transactions: TransactionStore::new(&config.mempool),
             sequence_number_cache: LruCache::new(config.mempool.capacity),
@@ -56,27 +58,33 @@ impl Mempool {
         sequence_number: u64,
         is_rejected: bool,
     ) {
-        debug!(
+        trace_event!("mempool:remove_transaction", {"txn", sender, sequence_number});
+        trace!(
             "[Mempool] Removing transaction from mempool: {}:{}:{}",
-            sender, sequence_number, is_rejected
+            sender,
+            sequence_number,
+            is_rejected
         );
         self.log_latency(sender.clone(), sequence_number, "e2e.latency");
         self.metrics_cache.remove(&(*sender, sequence_number));
         OP_COUNTERS.inc(&format!("remove_transaction.{}", is_rejected));
+
+        let current_seq_number = self
+            .sequence_number_cache
+            .remove(&sender)
+            .unwrap_or_default();
 
         if is_rejected {
             debug!(
                 "[Mempool] transaction is rejected: {}:{}",
                 sender, sequence_number
             );
-            self.transactions
-                .reject_transaction(&sender, sequence_number);
+            if sequence_number >= current_seq_number {
+                self.transactions
+                    .reject_transaction(&sender, sequence_number);
+            }
         } else {
             // update current cached sequence number for account
-            let current_seq_number = self
-                .sequence_number_cache
-                .remove(&sender)
-                .unwrap_or_default();
             let new_seq_number = max(current_seq_number, sequence_number + 1);
             self.sequence_number_cache
                 .insert(sender.clone(), new_seq_number);
@@ -94,38 +102,23 @@ impl Mempool {
         }
     }
 
-    fn get_required_balance(&mut self, txn: &SignedTransaction, gas_amount: u64) -> u64 {
-        txn.gas_unit_price() * gas_amount + self.transactions.get_required_balance(&txn.sender())
-    }
-
     /// Used to add a transaction to the Mempool
-    /// Performs basic validation: checks account's balance and sequence number
+    /// Performs basic validation: checks account's sequence number
     pub(crate) fn add_txn(
         &mut self,
         txn: SignedTransaction,
         gas_amount: u64,
+        rankin_score: u64,
         db_sequence_number: u64,
-        balance: u64,
         timeline_state: TimelineState,
-    ) -> MempoolAddTransactionStatus {
-        debug!(
+    ) -> MempoolStatus {
+        trace_event!("mempool::add_txn", {"txn", txn.sender(), txn.sequence_number()});
+        trace!(
             "[Mempool] Adding transaction to mempool: {}:{}:{}",
             &txn.sender(),
             txn.sequence_number(),
             db_sequence_number,
         );
-
-        let required_balance = self.get_required_balance(&txn, gas_amount);
-        if balance < required_balance {
-            return MempoolAddTransactionStatus::new(
-                MempoolAddTransactionStatusCode::InsufficientBalance,
-                format!(
-                    "balance: {}, required_balance: {}, gas_amount: {}",
-                    balance, required_balance, gas_amount
-                ),
-            );
-        }
-
         let cached_value = self.sequence_number_cache.get_mut(&txn.sender());
         let sequence_number =
             cached_value.map_or(db_sequence_number, |value| max(*value, db_sequence_number));
@@ -134,14 +127,11 @@ impl Mempool {
 
         // don't accept old transactions (e.g. seq is less than account's current seq_number)
         if txn.sequence_number() < sequence_number {
-            return MempoolAddTransactionStatus::new(
-                MempoolAddTransactionStatusCode::InvalidSeqNumber,
-                format!(
-                    "transaction sequence number is {}, current sequence number is  {}",
-                    txn.sequence_number(),
-                    sequence_number,
-                ),
-            );
+            return MempoolStatus::new(MempoolStatusCode::InvalidSeqNumber).with_message(format!(
+                "transaction sequence number is {}, current sequence number is  {}",
+                txn.sequence_number(),
+                sequence_number,
+            ));
         }
 
         let expiration_time = SystemTime::now()
@@ -156,7 +146,13 @@ impl Mempool {
             );
         }
 
-        let txn_info = MempoolTransaction::new(txn, expiration_time, gas_amount, timeline_state);
+        let txn_info = MempoolTransaction::new(
+            txn,
+            expiration_time,
+            gas_amount,
+            rankin_score,
+            timeline_state,
+        );
 
         let status = self.transactions.insert(txn_info, sequence_number);
         OP_COUNTERS.inc(&format!("insert.{:?}", status));
@@ -167,6 +163,7 @@ impl Mempool {
     /// `batch_size` - size of requested block
     /// `seen_txns` - transactions that were sent to Consensus but were not committed yet
     ///  Mempool should filter out such transactions
+    #[allow(clippy::explicit_counter_loop)]
     pub(crate) fn get_block(
         &mut self,
         batch_size: u64,
@@ -180,9 +177,11 @@ impl Mempool {
         // but can't be executed before first txn. Once observed, such txn will be saved in
         // `skipped` DS and rechecked once it's ancestor becomes available
         let mut skipped = HashSet::new();
-
+        let seen_size = seen.len();
+        let mut txn_walked = 0usize;
         // iterate over the queue of transactions based on gas price
         'main: for txn in self.transactions.iter_queue() {
+            txn_walked += 1;
             if seen.contains(&TxnPointer::from(txn)) {
                 continue;
             }
@@ -194,6 +193,7 @@ impl Mempool {
             if seen_previous || account_sequence_number == Some(&mut seq) {
                 let ptr = TxnPointer::from(txn);
                 seen.insert(ptr);
+                trace_event!("mempool::get_block", {"txn", txn.address, txn.sequence_number});
                 result.push(ptr);
                 if (result.len() as u64) == batch_size {
                     break;
@@ -214,11 +214,14 @@ impl Mempool {
                 skipped.insert(TxnPointer::from(txn));
             }
         }
+        let result_size = result.len();
         // convert transaction pointers to real values
         let block: Vec<_> = result
             .into_iter()
             .filter_map(|(address, seq)| self.transactions.get(&address, seq))
             .collect();
+        debug!("mempool::get_block: seen_consensus={}, walked={}, seen_after={}, result_size={}, block_size={}",
+               seen_size, txn_walked, seen.len(), result_size, block.len());
         for transaction in &block {
             self.log_latency(
                 transaction.sender(),
@@ -249,8 +252,14 @@ impl Mempool {
         self.transactions.read_timeline(timeline_id, count)
     }
 
-    /// Check the health of core mempool.
-    pub(crate) fn health_check(&self) -> bool {
-        self.transactions.health_check()
+    /// Read transactions from timeline whose timeline id is in range
+    /// `start_timeline_id` (exclusive) to `end_timeline_id` (inclusive)
+    pub(crate) fn timeline_range(
+        &mut self,
+        start_timeline_id: u64,
+        end_timeline_id: u64,
+    ) -> Vec<SignedTransaction> {
+        self.transactions
+            .timeline_range(start_timeline_id, end_timeline_id)
     }
 }

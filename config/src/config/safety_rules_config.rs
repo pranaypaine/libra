@@ -1,31 +1,29 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::config::BaseConfig;
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SafetyRulesConfig {
     pub backend: SafetyRulesBackend,
-    #[serde(skip)]
-    pub base: Arc<BaseConfig>,
+    pub service: SafetyRulesService,
 }
 
 impl Default for SafetyRulesConfig {
     fn default() -> Self {
         Self {
             backend: SafetyRulesBackend::InMemoryStorage,
-            base: Arc::new(BaseConfig::default()),
+            service: SafetyRulesService::Local,
         }
     }
 }
 
 impl SafetyRulesConfig {
-    pub fn prepare(&mut self, base: Arc<BaseConfig>) {
+    pub fn set_data_dir(&mut self, data_dir: PathBuf) {
         if let SafetyRulesBackend::OnDiskStorage(backend) = &mut self.backend {
-            backend.prepare(base);
+            backend.set_data_dir(data_dir);
         }
     }
 }
@@ -35,6 +33,7 @@ impl SafetyRulesConfig {
 #[serde(rename_all = "snake_case")]
 pub enum SafetyRulesBackend {
     InMemoryStorage,
+    Vault(VaultConfig),
     OnDiskStorage(OnDiskStorageConfig),
 }
 
@@ -46,15 +45,76 @@ pub struct OnDiskStorageConfig {
     // Required path for on disk storage
     pub path: PathBuf,
     #[serde(skip)]
-    pub base: Arc<BaseConfig>,
+    data_dir: PathBuf,
+}
+
+impl Default for OnDiskStorageConfig {
+    fn default() -> Self {
+        Self {
+            default: false,
+            path: PathBuf::from("safety_rules.toml"),
+            data_dir: PathBuf::from("/opt/libra/data/common"),
+        }
+    }
 }
 
 impl OnDiskStorageConfig {
-    pub fn prepare(&mut self, base: Arc<BaseConfig>) {
-        self.base = base;
+    pub fn path(&self) -> PathBuf {
+        if self.path.is_relative() {
+            self.data_dir.join(&self.path)
+        } else {
+            self.path.clone()
+        }
     }
 
-    pub fn path(&self) -> PathBuf {
-        self.base.full_path(&self.path)
+    pub fn set_data_dir(&mut self, data_dir: PathBuf) {
+        self.data_dir = data_dir;
     }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct VaultConfig {
+    /// In testing scenarios this will install baseline data if it is not specified. Note: this can
+    /// only be used if the token provided has root or sudo access.
+    pub default: bool,
+    /// A namespace is an optional portion of the path to a key stored within Vault. For example,
+    /// a secret, S, without a namespace would be available in secret/data/S, with a namespace, N, it
+    /// would be in secret/data/N/S.
+    pub namespace: Option<String>,
+    /// Vault's URL, note: only HTTP is currently supported.
+    pub server: String,
+    /// The authorization token for access secrets
+    pub token: String,
+}
+
+/// Defines how safety rules should be executed
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyRulesService {
+    /// This runs safety rules in the same thread as event processor
+    Local,
+    /// This is the production, separate service approach
+    Process(RemoteService),
+    /// This runs safety rules in the same thread as event processor but data is passed through the
+    /// light weight RPC (serializer)
+    Serializer,
+    /// This instructs Consensus that this is an test model, where Consensus should take the
+    /// existing config, create a new process, and pass it the config
+    SpawnedProcess(RemoteService),
+    /// This creates a separate thread to run safety rules, it is similar to a fork / exec style
+    Thread,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RemoteService {
+    pub server_address: SocketAddr,
+    pub consensus_type: ConsensusType,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+pub enum ConsensusType {
+    SignedTransactions,
+    Bytes,
+    Rounds,
 }

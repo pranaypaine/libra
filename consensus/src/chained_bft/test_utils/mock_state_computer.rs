@@ -5,70 +5,99 @@ use crate::{
     chained_bft::test_utils::{mock_storage::MockStorage, TestPayload},
     state_replication::StateComputer,
 };
+use anyhow::{format_err, Result};
 use consensus_types::block::Block;
-use consensus_types::executed_block::ExecutedBlock;
-use executor::{ExecutedTrees, ProcessedVMOutput};
-use failure::Result;
-use futures::{channel::mpsc, future, Future, FutureExt};
+use executor_types::StateComputeResult;
+use futures::channel::mpsc;
+use libra_crypto::{hash::ACCUMULATOR_PLACEHOLDER_HASH, HashValue};
 use libra_logger::prelude::*;
-use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeEventWithProof};
-use libra_types::validator_set::ValidatorSet;
-use std::{pin::Pin, sync::Arc};
+use libra_types::{
+    ledger_info::LedgerInfoWithSignatures, validator_change::ValidatorChangeProof,
+    validator_set::ValidatorSet,
+};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 use termion::color::*;
 
 pub struct MockStateComputer {
+    state_sync_client: mpsc::UnboundedSender<Vec<usize>>,
     commit_callback: mpsc::UnboundedSender<LedgerInfoWithSignatures>,
     consensus_db: Arc<MockStorage<TestPayload>>,
     reconfig: Option<ValidatorSet>,
+    block_cache: Mutex<HashMap<HashValue, Vec<usize>>>,
 }
 
 impl MockStateComputer {
     pub fn new(
+        state_sync_client: mpsc::UnboundedSender<Vec<usize>>,
         commit_callback: mpsc::UnboundedSender<LedgerInfoWithSignatures>,
         consensus_db: Arc<MockStorage<TestPayload>>,
         reconfig: Option<ValidatorSet>,
     ) -> Self {
         MockStateComputer {
+            state_sync_client,
             commit_callback,
             consensus_db,
             reconfig,
+            block_cache: Mutex::new(HashMap::new()),
         }
     }
 }
 
+#[async_trait::async_trait]
 impl StateComputer for MockStateComputer {
     type Payload = Vec<usize>;
     fn compute(
         &self,
-        _block: &Block<Self::Payload>,
-        _parent_executed_trees: ExecutedTrees,
-    ) -> Pin<Box<dyn Future<Output = Result<ProcessedVMOutput>> + Send>> {
-        future::ok(ProcessedVMOutput::new(
+        block: &Block<Self::Payload>,
+        _parent_block_id: HashValue,
+    ) -> Result<StateComputeResult> {
+        self.block_cache
+            .lock()
+            .unwrap()
+            .insert(block.id(), block.payload().unwrap_or(&vec![]).clone());
+        Ok(StateComputeResult::new(
+            *ACCUMULATOR_PLACEHOLDER_HASH,
             vec![],
-            ExecutedTrees::new_empty(),
+            0,
             self.reconfig.clone(),
+            vec![],
+            vec![],
         ))
-        .boxed()
     }
 
-    fn commit(
+    async fn commit(
         &self,
-        _blocks: Vec<&ExecutedBlock<Self::Payload>>,
+        block_ids: Vec<HashValue>,
         commit: LedgerInfoWithSignatures,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    ) -> Result<()> {
         self.consensus_db
             .commit_to_storage(commit.ledger_info().clone());
+
+        // mock sending commit notif to state sync
+        let mut txns = vec![];
+        for block_id in block_ids {
+            let mut payload = self
+                .block_cache
+                .lock()
+                .unwrap()
+                .remove(&block_id)
+                .ok_or_else(|| format_err!("Cannot find block"))?;
+            txns.append(&mut payload);
+        }
+        self.state_sync_client
+            .unbounded_send(txns)
+            .expect("Fail to notify state sync about commit");
 
         self.commit_callback
             .unbounded_send(commit)
             .expect("Fail to notify about commit.");
-        future::ok(()).boxed()
+        Ok(())
     }
 
-    fn sync_to(
-        &self,
-        commit: LedgerInfoWithSignatures,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+    async fn sync_to(&self, commit: LedgerInfoWithSignatures) -> Result<()> {
         debug!(
             "{}Fake sync{} to block id {}",
             Fg(Blue),
@@ -78,69 +107,61 @@ impl StateComputer for MockStateComputer {
         self.consensus_db
             .commit_to_storage(commit.ledger_info().clone());
         self.commit_callback
-            .unbounded_send(commit.clone())
+            .unbounded_send(commit)
             .expect("Fail to notify about sync");
-        async { Ok(()) }.boxed()
+        Ok(())
     }
 
-    fn committed_trees(&self) -> ExecutedTrees {
-        ExecutedTrees::new_empty()
-    }
-
-    fn get_epoch_proof(
+    async fn get_epoch_proof(
         &self,
         _start_epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<ValidatorChangeEventWithProof>> + Send>> {
-        future::err(format_err!(
+        _end_epoch: u64,
+    ) -> Result<ValidatorChangeProof> {
+        Err(format_err!(
             "epoch proof not supported in mock state computer"
         ))
-        .boxed()
     }
 }
 
 pub struct EmptyStateComputer;
 
+#[async_trait::async_trait]
 impl StateComputer for EmptyStateComputer {
     type Payload = TestPayload;
     fn compute(
         &self,
         _block: &Block<Self::Payload>,
-        _parent_executed_trees: ExecutedTrees,
-    ) -> Pin<Box<dyn Future<Output = Result<ProcessedVMOutput>> + Send>> {
-        future::ok(ProcessedVMOutput::new(
+        _parent_block_id: HashValue,
+    ) -> Result<StateComputeResult> {
+        Ok(StateComputeResult::new(
+            *ACCUMULATOR_PLACEHOLDER_HASH,
             vec![],
-            ExecutedTrees::new_empty(),
+            0,
             None,
+            vec![],
+            vec![],
         ))
-        .boxed()
     }
 
-    fn commit(
+    async fn commit(
         &self,
-        _blocks: Vec<&ExecutedBlock<Self::Payload>>,
+        _block_ids: Vec<HashValue>,
         _commit: LedgerInfoWithSignatures,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        future::ok(()).boxed()
+    ) -> Result<()> {
+        Ok(())
     }
 
-    fn sync_to(
-        &self,
-        _commit: LedgerInfoWithSignatures,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        async { Ok(()) }.boxed()
+    async fn sync_to(&self, _commit: LedgerInfoWithSignatures) -> Result<()> {
+        Ok(())
     }
 
-    fn committed_trees(&self) -> ExecutedTrees {
-        ExecutedTrees::new_empty()
-    }
-
-    fn get_epoch_proof(
+    async fn get_epoch_proof(
         &self,
         _start_epoch: u64,
-    ) -> Pin<Box<dyn Future<Output = Result<ValidatorChangeEventWithProof>> + Send>> {
-        future::err(format_err!(
+        _end_epoch: u64,
+    ) -> Result<ValidatorChangeProof> {
+        Err(format_err!(
             "epoch proof not supported in empty state computer"
         ))
-        .boxed()
     }
 }

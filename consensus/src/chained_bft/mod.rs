@@ -4,12 +4,12 @@
 mod consensusdb;
 
 mod block_storage;
-pub mod chained_bft_consensus_provider;
-mod chained_bft_smr;
+pub mod chained_bft_smr;
 mod network;
+pub mod network_interface;
 
 pub mod epoch_manager;
-pub mod persistent_storage;
+pub mod persistent_liveness_storage;
 
 #[cfg(test)]
 mod chained_bft_smr_test;
@@ -23,5 +23,5 @@ mod liveness;
 
 mod event_processor;
 
-#[cfg(feature = "fuzzing")]
+#[cfg(any(test, feature = "fuzzing"))]
 pub use event_processor::event_processor_fuzzing;

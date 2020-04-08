@@ -3,25 +3,32 @@
 
 //! Support for encoding transactions for common situations.
 
-use crate::{account::Account, compile::compile_script, gas_costs};
-use lazy_static::lazy_static;
+use crate::{account::Account, gas_costs};
 use libra_types::{
     account_address::AccountAddress,
-    byte_array::ByteArray,
-    transaction::{SignedTransaction, TransactionArgument},
+    account_config::lbr_type_tag,
+    transaction::{RawTransaction, SignedTransaction, TransactionArgument},
 };
-use stdlib::transaction_scripts;
+use stdlib::transaction_scripts::StdlibScript;
 
-lazy_static! {
-    /// A serialized transaction to create a new account.
-    pub static ref CREATE_ACCOUNT: Vec<u8> = { create_account() };
-    /// A serialized transaction to mint new funds.
-    pub static ref MINT: Vec<u8> = { mint() };
-    /// A serialized transaction to transfer coin from one account to another (possibly new)
-    /// one.
-    pub static ref PEER_TO_PEER: Vec<u8> = { peer_to_peer() };
-    /// A serialized transaction to change the keys for an account.
-    pub static ref ROTATE_KEY: Vec<u8> = { rotate_key() };
+/// Returns a transaction to add a new validator
+pub fn add_validator_txn(
+    sender: &Account,
+    new_validator: &Account,
+    seq_num: u64,
+) -> SignedTransaction {
+    let mut args: Vec<TransactionArgument> = Vec::new();
+    args.push(TransactionArgument::Address(*new_validator.address()));
+
+    sender.create_signed_txn_with_args(
+        StdlibScript::AddValidator.compiled_bytes().into_vec(),
+        vec![],
+        args,
+        seq_num,
+        gas_costs::TXN_RESERVED,
+        1,
+        lbr_type_tag(),
+    )
 }
 
 /// Returns a transaction to create a new account with the given arguments.
@@ -33,14 +40,17 @@ pub fn create_account_txn(
 ) -> SignedTransaction {
     let mut args: Vec<TransactionArgument> = Vec::new();
     args.push(TransactionArgument::Address(*new_account.address()));
+    args.push(TransactionArgument::U8Vector(new_account.auth_key_prefix()));
     args.push(TransactionArgument::U64(initial_amount));
 
     sender.create_signed_txn_with_args(
-        CREATE_ACCOUNT.clone(),
+        StdlibScript::CreateAccount.compiled_bytes().into_vec(),
+        vec![],
         args,
         seq_num,
         gas_costs::TXN_RESERVED,
         1,
+        lbr_type_tag(),
     )
 }
 
@@ -54,33 +64,105 @@ pub fn peer_to_peer_txn(
 ) -> SignedTransaction {
     let mut args: Vec<TransactionArgument> = Vec::new();
     args.push(TransactionArgument::Address(*receiver.address()));
+    args.push(TransactionArgument::U8Vector(receiver.auth_key_prefix()));
     args.push(TransactionArgument::U64(transfer_amount));
 
     // get a SignedTransaction
     sender.create_signed_txn_with_args(
-        PEER_TO_PEER.clone(),
+        StdlibScript::PeerToPeer.compiled_bytes().into_vec(),
+        vec![lbr_type_tag()],
         args,
         seq_num,
         gas_costs::TXN_RESERVED, // this is a default for gas
         1,                       // this is a default for gas
+        lbr_type_tag(),
     )
 }
 
-/// Returns a transaction to change the keys for the given account.
-pub fn rotate_key_txn(
+/// Returns a transaction to register the sender as a candidate validator
+pub fn register_validator_txn(
     sender: &Account,
-    new_key_hash: AccountAddress,
+    consensus_pubkey: Vec<u8>,
+    validator_network_signing_pubkey: Vec<u8>,
+    validator_network_identity_pubkey: Vec<u8>,
+    validator_network_address: Vec<u8>,
+    fullnodes_network_identity_pubkey: Vec<u8>,
+    fullnodes_network_address: Vec<u8>,
     seq_num: u64,
 ) -> SignedTransaction {
-    let args = vec![TransactionArgument::ByteArray(ByteArray::new(
-        new_key_hash.to_vec(),
-    ))];
+    let args = vec![
+        TransactionArgument::U8Vector(consensus_pubkey),
+        TransactionArgument::U8Vector(validator_network_signing_pubkey),
+        TransactionArgument::U8Vector(validator_network_identity_pubkey),
+        TransactionArgument::U8Vector(validator_network_address),
+        TransactionArgument::U8Vector(fullnodes_network_identity_pubkey),
+        TransactionArgument::U8Vector(fullnodes_network_address),
+    ];
     sender.create_signed_txn_with_args(
-        ROTATE_KEY.clone(),
+        StdlibScript::RegisterValidator.compiled_bytes().into_vec(),
+        vec![],
         args,
         seq_num,
         gas_costs::TXN_RESERVED,
         1,
+        lbr_type_tag(),
+    )
+}
+
+/// Returns a transaction to change the keys for the given account.
+pub fn rotate_key_txn(sender: &Account, new_key_hash: Vec<u8>, seq_num: u64) -> SignedTransaction {
+    let args = vec![TransactionArgument::U8Vector(new_key_hash)];
+    sender.create_signed_txn_with_args(
+        StdlibScript::RotateAuthenticationKey
+            .compiled_bytes()
+            .into_vec(),
+        vec![],
+        args,
+        seq_num,
+        gas_costs::TXN_RESERVED,
+        1,
+        lbr_type_tag(),
+    )
+}
+
+/// Returns a transaction to change the keys for the given account.
+pub fn raw_rotate_key_txn(
+    sender: AccountAddress,
+    new_key_hash: Vec<u8>,
+    seq_num: u64,
+) -> RawTransaction {
+    let args = vec![TransactionArgument::U8Vector(new_key_hash)];
+    Account::create_raw_txn_with_args(
+        sender,
+        StdlibScript::RotateAuthenticationKey
+            .compiled_bytes()
+            .into_vec(),
+        vec![],
+        args,
+        seq_num,
+        gas_costs::TXN_RESERVED,
+        1,
+        lbr_type_tag(),
+    )
+}
+
+/// Returns a transaction to change the keys for the given account.
+pub fn rotate_consensus_pubkey_txn(
+    sender: &Account,
+    new_key_hash: Vec<u8>,
+    seq_num: u64,
+) -> SignedTransaction {
+    let args = vec![TransactionArgument::U8Vector(new_key_hash)];
+    sender.create_signed_txn_with_args(
+        StdlibScript::RotateConsensusPubkey
+            .compiled_bytes()
+            .into_vec(),
+        vec![],
+        args,
+        seq_num,
+        gas_costs::TXN_RESERVED,
+        1,
+        lbr_type_tag(),
     )
 }
 
@@ -93,30 +175,17 @@ pub fn mint_txn(
 ) -> SignedTransaction {
     let mut args: Vec<TransactionArgument> = Vec::new();
     args.push(TransactionArgument::Address(*receiver.address()));
+    args.push(TransactionArgument::U8Vector(receiver.auth_key_prefix()));
     args.push(TransactionArgument::U64(transfer_amount));
 
     // get a SignedTransaction
     sender.create_signed_txn_with_args(
-        MINT.clone(),
+        StdlibScript::Mint.compiled_bytes().into_vec(),
+        vec![],
         args,
         seq_num,
         gas_costs::TXN_RESERVED, // this is a default for gas
         1,                       // this is a default for gas
+        lbr_type_tag(),
     )
-}
-
-fn create_account() -> Vec<u8> {
-    compile_script(transaction_scripts::create_account())
-}
-
-fn mint() -> Vec<u8> {
-    compile_script(transaction_scripts::mint())
-}
-
-fn peer_to_peer() -> Vec<u8> {
-    compile_script(transaction_scripts::peer_to_peer())
-}
-
-fn rotate_key() -> Vec<u8> {
-    compile_script(transaction_scripts::rotate_key())
 }

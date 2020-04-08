@@ -9,12 +9,11 @@
 pub mod absint;
 pub mod abstract_state;
 pub mod acquires_list_verifier;
-pub mod borrow_graph;
 pub mod check_duplication;
 pub mod code_unit_verifier;
 pub mod control_flow_graph;
 pub mod instantiation_loops;
-pub mod nonce;
+pub mod resolver;
 pub mod resources;
 pub mod signature;
 pub mod stack_usage_verifier;
@@ -30,8 +29,7 @@ pub use resources::ResourceTransitiveChecker;
 pub use signature::SignatureChecker;
 pub use stack_usage_verifier::StackUsageVerifier;
 pub use struct_defs::RecursiveStructDefChecker;
-pub use unused_entries::UnusedEntryChecker;
 pub use verifier::{
-    verify_main_signature, verify_module_dependencies, verify_script_dependencies, VerifiedModule,
-    VerifiedScript,
+    batch_verify_modules, verify_main_signature, verify_module_dependencies,
+    verify_script_dependencies, VerifiedModule, VerifiedScript,
 };

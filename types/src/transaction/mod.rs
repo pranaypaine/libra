@@ -1,23 +1,25 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 use crate::{
     account_address::AccountAddress,
+    account_config::lbr_type_tag,
     account_state_blob::AccountStateBlob,
     block_metadata::BlockMetadata,
     contract_event::ContractEvent,
+    language_storage::TypeTag,
     ledger_info::LedgerInfo,
     proof::{accumulator::InMemoryAccumulator, TransactionListProof, TransactionProof},
+    transaction::authenticator::TransactionAuthenticator,
     vm_error::{StatusCode, StatusType, VMStatus},
     write_set::WriteSet,
 };
-use failure::prelude::*;
+use anyhow::{ensure, format_err, Error, Result};
 use libra_crypto::{
     ed25519::*,
     hash::{CryptoHash, CryptoHasher, EventAccumulatorHasher},
-    traits::*,
+    multi_ed25519::{MultiEd25519PublicKey, MultiEd25519Signature},
+    traits::SigningKey,
     HashValue,
 };
 use libra_crypto_derive::CryptoHasher;
@@ -28,9 +30,11 @@ use std::{
     collections::HashMap,
     convert::{TryFrom, TryInto},
     fmt,
+    fmt::{Display, Formatter},
     time::Duration,
 };
 
+pub mod authenticator;
 mod change_set;
 pub mod helpers;
 mod module;
@@ -45,6 +49,9 @@ use std::ops::Deref;
 pub use transaction_argument::{parse_as_transaction_argument, TransactionArgument};
 
 pub type Version = u64; // Height - also used for MVCC in StateDB
+
+// In StateDB, things readable by the genesis transaction are under this version.
+pub const PRE_GENESIS_VERSION: Version = u64::max_value();
 
 pub const MAX_TRANSACTION_SIZE_IN_BYTES: usize = 4096;
 
@@ -62,6 +69,8 @@ pub struct RawTransaction {
     max_gas_amount: u64,
     // Maximal price can be paid per gas.
     gas_unit_price: u64,
+
+    gas_specifier: TypeTag,
     // Expiration time for this transaction.  If storage is queried and
     // the time returned is greater than or equal to this time and this
     // transaction has not been included, you can be certain that it will
@@ -115,6 +124,7 @@ impl RawTransaction {
         payload: TransactionPayload,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_specifier: TypeTag,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -123,6 +133,7 @@ impl RawTransaction {
             payload,
             max_gas_amount,
             gas_unit_price,
+            gas_specifier,
             expiration_time,
         }
     }
@@ -136,6 +147,7 @@ impl RawTransaction {
         script: Script,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_specifier: TypeTag,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -144,6 +156,7 @@ impl RawTransaction {
             payload: TransactionPayload::Script(script),
             max_gas_amount,
             gas_unit_price,
+            gas_specifier,
             expiration_time,
         }
     }
@@ -158,6 +171,7 @@ impl RawTransaction {
         module: Module,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_specifier: TypeTag,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -166,6 +180,7 @@ impl RawTransaction {
             payload: TransactionPayload::Module(module),
             max_gas_amount,
             gas_unit_price,
+            gas_specifier,
             expiration_time,
         }
     }
@@ -182,6 +197,7 @@ impl RawTransaction {
             // Since write-set transactions bypass the VM, these fields aren't relevant.
             max_gas_amount: 0,
             gas_unit_price: 0,
+            gas_specifier: lbr_type_tag(),
             // Write-set transactions are special and important and shouldn't expire.
             expiration_time: Duration::new(u64::max_value(), 0),
         }
@@ -199,6 +215,7 @@ impl RawTransaction {
             // Since write-set transactions bypass the VM, these fields aren't relevant.
             max_gas_amount: 0,
             gas_unit_price: 0,
+            gas_specifier: lbr_type_tag(),
             // Write-set transactions are special and important and shouldn't expire.
             expiration_time: Duration::new(u64::max_value(), 0),
         }
@@ -306,12 +323,8 @@ pub struct SignedTransaction {
     /// The raw transaction
     raw_txn: RawTransaction,
 
-    /// Sender's public key. When checking the signature, we first need to check whether this key
-    /// is indeed the pre-image of the pubkey hash stored under sender's account.
-    public_key: Ed25519PublicKey,
-
-    /// Signature of the transaction that correspond to the public key
-    signature: Ed25519Signature,
+    /// Public key and signature to authenticate
+    authenticator: TransactionAuthenticator,
 }
 
 /// A transaction for which the signature has been verified. Created by
@@ -345,11 +358,10 @@ impl fmt::Debug for SignedTransaction {
             f,
             "SignedTransaction {{ \n \
              {{ raw_txn: {:#?}, \n \
-             public_key: {:#?}, \n \
-             signature: {:#?}, \n \
+             authenticator: {:#?}, \n \
              }} \n \
              }}",
-            self.raw_txn, self.public_key, self.signature,
+            self.raw_txn, self.authenticator
         )
     }
 }
@@ -360,19 +372,27 @@ impl SignedTransaction {
         public_key: Ed25519PublicKey,
         signature: Ed25519Signature,
     ) -> SignedTransaction {
+        let authenticator = TransactionAuthenticator::ed25519(public_key, signature);
         SignedTransaction {
             raw_txn,
-            public_key,
-            signature,
+            authenticator,
         }
     }
 
-    pub fn public_key(&self) -> Ed25519PublicKey {
-        self.public_key.clone()
+    pub fn new_multisig(
+        raw_txn: RawTransaction,
+        public_key: MultiEd25519PublicKey,
+        signature: MultiEd25519Signature,
+    ) -> SignedTransaction {
+        let authenticator = TransactionAuthenticator::multi_ed25519(public_key, signature);
+        SignedTransaction {
+            raw_txn,
+            authenticator,
+        }
     }
 
-    pub fn signature(&self) -> Ed25519Signature {
-        self.signature.clone()
+    pub fn authenticator(&self) -> TransactionAuthenticator {
+        self.authenticator.clone()
     }
 
     pub fn sender(&self) -> AccountAddress {
@@ -412,8 +432,7 @@ impl SignedTransaction {
     /// Checks that the signature of given transaction. Returns `Ok(SignatureCheckedTransaction)` if
     /// the signature is valid.
     pub fn check_signature(self) -> Result<SignatureCheckedTransaction> {
-        self.public_key
-            .verify_signature(&self.raw_txn.hash(), &self.signature)?;
+        self.authenticator.verify_signature(&self.raw_txn.hash())?;
         Ok(SignatureCheckedTransaction(self))
     }
 
@@ -421,12 +440,10 @@ impl SignedTransaction {
         format!(
             "SignedTransaction {{ \n \
              raw_txn: {}, \n \
-             public_key: {:#?}, \n \
-             signature: {:#?}, \n \
+             authenticator: {:#?}, \n \
              }}",
             self.raw_txn.format_for_client(get_transaction_name),
-            self.public_key,
-            self.signature,
+            self.authenticator
         )
     }
 }
@@ -452,7 +469,7 @@ impl From<SignatureCheckedTransaction> for crate::proto::types::SignedTransactio
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct TransactionWithProof {
     pub version: Version,
@@ -571,12 +588,26 @@ pub enum TransactionStatus {
 
     /// Keep the transaction output
     Keep(VMStatus),
+
+    /// Retry the transaction because it is after a ValidatorSetChange txn
+    Retry,
 }
 
 impl TransactionStatus {
-    pub fn vm_status(&self) -> &VMStatus {
+    pub fn vm_status(&self) -> VMStatus {
         match self {
-            TransactionStatus::Discard(vm_status) | TransactionStatus::Keep(vm_status) => vm_status,
+            TransactionStatus::Discard(vm_status) | TransactionStatus::Keep(vm_status) => {
+                vm_status.clone()
+            }
+            TransactionStatus::Retry => VMStatus::new(StatusCode::UNKNOWN_VALIDATION_STATUS),
+        }
+    }
+
+    pub fn is_discarded(&self) -> bool {
+        match self {
+            TransactionStatus::Discard(_) => true,
+            TransactionStatus::Keep(_) => false,
+            TransactionStatus::Retry => true,
         }
     }
 }
@@ -591,13 +622,8 @@ impl From<VMStatus> for TransactionStatus {
             StatusType::Validation => true,
             // If the VM encountered an invalid internal state, we should discard the transaction.
             StatusType::InvariantViolation => true,
-            // A transaction that publishes code that cannot be verified is currently not charged.
-            // Therefore the transaction can be excluded.
-            //
-            // The original plan was to charge for verification, but the code didn't implement it
-            // properly. The decision of whether to charge or not will be made based on data (if
-            // verification checks are too expensive then yes, otherwise no).
-            StatusType::Verification => true,
+            // A transaction that publishes code that cannot be verified will be charged.
+            StatusType::Verification => false,
             // Even if we are unable to decode the transaction, there should be a charge made to
             // that user's account for the gas fees related to decoding, running the prologue etc.
             StatusType::Deserialization => false,
@@ -610,6 +636,27 @@ impl From<VMStatus> for TransactionStatus {
         } else {
             TransactionStatus::Keep(vm_status)
         }
+    }
+}
+
+/// The result of running the transaction through the VM validator.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VMValidatorResult {
+    status: Option<VMStatus>,
+    score: u64,
+}
+
+impl VMValidatorResult {
+    pub fn new(status: Option<VMStatus>, score: u64) -> Self {
+        Self { status, score }
+    }
+
+    pub fn status(&self) -> Option<VMStatus> {
+        self.status.clone()
+    }
+
+    pub fn score(&self) -> u64 {
+        self.score
     }
 }
 
@@ -695,7 +742,7 @@ impl From<TransactionInfo> for crate::proto::types::TransactionInfo {
 
 /// `TransactionInfo` is the object we store in the transaction accumulator. It consists of the
 /// transaction as well as the execution result of this transaction.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, CryptoHasher)]
+#[derive(Clone, CryptoHasher, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct TransactionInfo {
     /// The hash of this transaction.
@@ -773,7 +820,17 @@ impl CryptoHash for TransactionInfo {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl Display for TransactionInfo {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "TransactionInfo: [txn_hash: {}, state_root_hash: {}, event_root_hash: {}, gas_used: {}, major_status: {:?}]",
+            self.transaction_hash(), self.state_root_hash(), self.event_root_hash(), self.gas_used(), self.major_status(),
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct TransactionToCommit {
     transaction: Transaction,
     account_states: HashMap<AccountAddress, AccountStateBlob>,
@@ -886,7 +943,7 @@ impl From<TransactionToCommit> for crate::proto::types::TransactionToCommit {
 /// 2. The list has only 1 transaction/transaction_info. Then `proof_of_first_transaction`
 /// must exist and `proof_of_last_transaction` must be `None`.
 /// 3. The list has 2+ transactions/transaction_infos. The both proofs must exist.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 pub struct TransactionListWithProof {
     pub transactions: Vec<Transaction>,
     pub events: Option<Vec<Vec<ContractEvent>>>,
@@ -1070,7 +1127,7 @@ pub enum Transaction {
 
     /// Transaction that applies a WriteSet to the current storage. This should be used for ONLY for
     /// genesis right now.
-    WriteSet(WriteSet),
+    WaypointWriteSet(ChangeSet),
 
     /// Transaction to update the block metadata resource at the beginning of a block.
     BlockMetadata(BlockMetadata),
@@ -1090,7 +1147,7 @@ impl Transaction {
                 user_txn.format_for_client(get_transaction_name)
             }
             // TODO: display proper information for client
-            Transaction::WriteSet(_write_set) => String::from("genesis"),
+            Transaction::WaypointWriteSet(_write_set) => String::from("genesis"),
             // TODO: display proper information for client
             Transaction::BlockMetadata(_block_metadata) => String::from("block_metadata"),
         }

@@ -3,7 +3,7 @@
 
 //! The following document is a minimalist version of Libra Wallet. Note that this Wallet does
 //! not promote security as the mnemonic is stored in unencrypted form. In future iterations,
-//! we will be realesing more robust Wallet implementations. It is our intention to present a
+//! we will be releasing more robust Wallet implementations. It is our intention to present a
 //! foundation that is simple to understand and incrementally improve the LibraWallet
 //! implementation and it's security guarantees throughout testnet. For a more robust wallet
 //! reference, the authors suggest to audit the file of the same name in the rust-wallet crate.
@@ -12,18 +12,19 @@
 //! https://github.com/rust-bitcoin/rust-wallet/blob/master/wallet/src/walletlibrary.rs
 
 use crate::{
-    error::*,
+    error::WalletError,
     io_utils,
     key_factory::{ChildNumber, KeyFactory, Seed},
     mnemonic::Mnemonic,
 };
-pub use libra_crypto::{
-    ed25519::{Ed25519PublicKey, Ed25519Signature},
-    hash::CryptoHash,
-};
+use anyhow::Result;
+use libra_crypto::hash::CryptoHash;
 use libra_types::{
     account_address::AccountAddress,
-    transaction::{helpers::TransactionSigner, RawTransaction, SignedTransaction},
+    transaction::{
+        authenticator::AuthenticationKey, helpers::TransactionSigner, RawTransaction,
+        SignedTransaction,
+    },
 };
 use rand::{rngs::EntropyRng, Rng};
 use std::{collections::HashMap, path::Path};
@@ -58,7 +59,7 @@ impl WalletLibrary {
         }
     }
 
-    /// Function that returns the string representation of the WalletLibrary Menmonic
+    /// Function that returns the string representation of the WalletLibrary Mnemonic
     /// NOTE: This is not secure, and in general the mnemonic should be stored in encrypted format
     pub fn mnemonic(&self) -> String {
         self.mnemonic.to_string()
@@ -89,7 +90,8 @@ impl WalletLibrary {
         if current > depth {
             return Err(WalletError::LibraWalletGeneric(
                 "Addresses already generated up to the supplied depth".to_string(),
-            ));
+            )
+            .into());
         }
         while self.key_leaf != ChildNumber(depth) {
             let _ = self.new_address();
@@ -103,22 +105,27 @@ impl WalletLibrary {
         child_number: ChildNumber,
     ) -> Result<AccountAddress> {
         let child = self.key_factory.private_child(child_number)?;
-        child.get_address()
+        Ok(child.get_address())
     }
 
     /// Function that generates a new key and adds it to the addr_map and subsequently returns the
-    /// AccountAddress associated to the PrivateKey, along with it's ChildNumber
-    pub fn new_address(&mut self) -> Result<(AccountAddress, ChildNumber)> {
+    /// AuthenticationKey associated to the PrivateKey, along with it's ChildNumber
+    pub fn new_address(&mut self) -> Result<(AuthenticationKey, ChildNumber)> {
         let child = self.key_factory.private_child(self.key_leaf)?;
-        let address = child.get_address()?;
+        let authentication_key = child.get_authentication_key();
         let old_key_leaf = self.key_leaf;
         self.key_leaf.increment();
-        if self.addr_map.insert(address, old_key_leaf).is_none() {
-            Ok((address, old_key_leaf))
+        if self
+            .addr_map
+            .insert(authentication_key.derived_address(), old_key_leaf)
+            .is_none()
+        {
+            Ok((authentication_key, old_key_leaf))
         } else {
             Err(WalletError::LibraWalletGeneric(
                 "This address is already in your wallet".to_string(),
-            ))
+            )
+            .into())
         }
     }
 
@@ -141,7 +148,8 @@ impl WalletLibrary {
                         "Child num {} not exist while depth is {}",
                         i,
                         self.addr_map.len()
-                    )))
+                    ))
+                    .into())
                 }
             }
         }
@@ -163,14 +171,15 @@ impl WalletLibrary {
         } else {
             Err(WalletError::LibraWalletGeneric(
                 "Well, that address is nowhere to be found... This is awkward".to_string(),
-            ))
+            )
+            .into())
         }
     }
 }
 
 /// WalletLibrary naturally support TransactionSigner trait.
 impl TransactionSigner for WalletLibrary {
-    fn sign_txn(&self, raw_txn: RawTransaction) -> failure::prelude::Result<SignedTransaction> {
+    fn sign_txn(&self, raw_txn: RawTransaction) -> Result<SignedTransaction, anyhow::Error> {
         Ok(self.sign_txn(raw_txn)?)
     }
 }

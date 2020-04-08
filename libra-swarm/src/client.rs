@@ -1,8 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::utils;
-use client_lib::{client_proxy::ClientProxy, commands};
+use cli::{client_proxy::ClientProxy, commands};
 use std::{
     collections::HashMap,
     io::{self, Write},
@@ -43,7 +42,6 @@ impl InteractiveClient {
         port: u16,
         faucet_key_file_path: &Path,
         mnemonic_file_path: &Path,
-        validator_set_file: String,
     ) -> Self {
         // We need to call canonicalize on the path because we are running client from
         // workspace root and the function calling new_with_inherit_io isn't necessarily
@@ -51,10 +49,10 @@ impl InteractiveClient {
         // unless we convert it to an absolute path
         Self {
             client: Some(
-                Command::new(utils::get_bin("client"))
-                    .current_dir(utils::workspace_root())
-                    .arg("-p")
-                    .arg(port.to_string())
+                Command::new(workspace_builder::get_bin("cli"))
+                    .current_dir(workspace_builder::workspace_root())
+                    .arg("-u")
+                    .arg(format!("http://localhost:{}", port))
                     .arg("-m")
                     .arg(
                         faucet_key_file_path
@@ -71,10 +69,6 @@ impl InteractiveClient {
                             .to_str()
                             .unwrap(),
                     )
-                    .arg("-a")
-                    .arg("localhost")
-                    .arg("-s")
-                    .arg(validator_set_file)
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit())
@@ -88,17 +82,16 @@ impl InteractiveClient {
         port: u16,
         faucet_key_file_path: &Path,
         mnemonic_file_path: &Path,
-        validator_set_file: String,
     ) -> Self {
         Self {
             /// Note: For easier debugging it's convenient to see the output
             /// from the client CLI. Comment the stdout/stderr lines below
             /// and enjoy pretty Matrix-style output.
             client: Some(
-                Command::new(utils::get_bin("client"))
-                    .current_dir(utils::workspace_root())
-                    .arg("-p")
-                    .arg(port.to_string())
+                Command::new(workspace_builder::get_bin("cli"))
+                    .current_dir(workspace_builder::workspace_root())
+                    .arg("-u")
+                    .arg(format!("http://localhost:{}", port))
                     .arg("-m")
                     .arg(
                         faucet_key_file_path
@@ -115,10 +108,6 @@ impl InteractiveClient {
                             .to_str()
                             .unwrap(),
                     )
-                    .arg("-a")
-                    .arg("localhost")
-                    .arg("-s")
-                    .arg(validator_set_file)
                     .stdin(Stdio::piped())
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -135,7 +124,7 @@ impl InteractiveClient {
     pub fn send_instructions(&mut self, instructions: &[&str]) -> io::Result<()> {
         let input = self.client.as_mut().unwrap().stdin.as_mut().unwrap();
         for i in instructions {
-            input.write_all((i.to_string() + "\n").as_bytes())?;
+            input.write_all(((*i).to_string() + "\n").as_bytes())?;
             input.flush()?;
         }
         Ok(())
@@ -148,18 +137,11 @@ pub struct InProcessTestClient {
 }
 
 impl InProcessTestClient {
-    pub fn new(
-        port: u16,
-        faucet_key_file_path: &Path,
-        mnemonic_file_path: &str,
-        validator_set_file: String,
-    ) -> Self {
+    pub fn new(port: u16, faucet_key_file_path: &Path, mnemonic_file_path: &str) -> Self {
         let (_, alias_to_cmd) = commands::get_commands(true);
         Self {
             client: ClientProxy::new(
-                "localhost",
-                port,
-                &validator_set_file,
+                &format!("http://localhost:{}", port),
                 faucet_key_file_path
                     .canonicalize()
                     .expect("Unable to get canonical path of faucet key file")
@@ -168,6 +150,7 @@ impl InProcessTestClient {
                 false,
                 /* faucet server */ None,
                 Some(mnemonic_file_path.to_string()),
+                None,
             )
             .unwrap(),
             alias_to_cmd,
@@ -176,8 +159,8 @@ impl InProcessTestClient {
 
     pub fn execute_instructions(&mut self, instructions: &[&str]) {
         for instr in instructions {
-            let to_parse = &instr.to_string();
-            let params = commands::parse_cmd(to_parse);
+            let to_parse = (*instr).to_string();
+            let params = commands::parse_cmd(&to_parse);
             // filter out empty lines
             if params.is_empty() || params[0].is_empty() {
                 continue;

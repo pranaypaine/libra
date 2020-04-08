@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::vote_data::VoteData;
-use failure::prelude::*;
+use anyhow::{ensure, Context};
 use libra_crypto::{hash::CryptoHash, HashValue};
 use libra_types::{
     block_info::BlockInfo,
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorVerifier},
-    ledger_info::LedgerInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    validator_verifier::ValidatorVerifier,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fmt::{Display, Formatter};
+use std::{
+    collections::BTreeMap,
+    fmt::{Display, Formatter},
+};
 
 #[derive(Deserialize, Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct QuorumCert {
@@ -94,7 +96,7 @@ impl QuorumCert {
         )
     }
 
-    pub fn verify(&self, validator: &ValidatorVerifier) -> failure::Result<()> {
+    pub fn verify(&self, validator: &ValidatorVerifier) -> anyhow::Result<()> {
         let vote_hash = self.vote_data.hash();
         ensure!(
             self.ledger_info().ledger_info().consensus_data_hash() == vote_hash,
@@ -119,8 +121,8 @@ impl QuorumCert {
             return Ok(());
         }
         self.ledger_info()
-            .verify(validator)
-            .with_context(|e| format!("Fail to verify QuorumCert: {:?}", e))?;
+            .verify_signatures(validator)
+            .context("Fail to verify QuorumCert")?;
         Ok(())
     }
 }

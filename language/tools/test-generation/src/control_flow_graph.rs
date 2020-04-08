@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::abstract_state::{AbstractValue, BorrowState};
+use libra_logger::debug;
 use rand::{rngs::StdRng, Rng};
 use std::collections::{HashMap, VecDeque};
-use vm::file_format::{Bytecode, FunctionSignature, SignatureToken};
+use vm::file_format::{Bytecode, Kind, Signature, SignatureToken};
 
 /// This type holds basic block identifiers
 type BlockIDSize = u16;
@@ -13,7 +14,7 @@ type BlockIDSize = u16;
 type BlockLocals = HashMap<usize, (AbstractValue, BorrowState)>;
 
 /// This represents a basic block in a control flow graph
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct BasicBlock {
     /// The starting locals
     locals_in: BlockLocals,
@@ -66,9 +67,9 @@ impl CFG {
     /// and outgoing locals.
     /// Currently the control flow graph is acyclic.
     pub fn new(
-        mut rng: &mut StdRng,
+        rng: &mut StdRng,
         locals: &[SignatureToken],
-        signature: &FunctionSignature,
+        parameters: &Signature,
         target_blocks: BlockIDSize,
     ) -> CFG {
         checked_precondition!(target_blocks > 0, "The CFG must haave at least one block");
@@ -134,7 +135,7 @@ impl CFG {
         };
         // Assign locals to basic blocks
         assume!(target_blocks == 0 || !cfg.basic_blocks.is_empty());
-        CFG::add_locals(&mut cfg, &mut rng, locals, signature.arg_types.len());
+        CFG::add_locals(&mut cfg, rng, locals, parameters.0.len());
         cfg
     }
 
@@ -218,8 +219,8 @@ impl CFG {
 
     /// Randomly vary the availability of locals
     fn vary_locals(rng: &mut StdRng, locals: BlockLocals) -> BlockLocals {
-        let mut locals = locals.clone();
-        for (_, (_, availability)) in locals.iter_mut() {
+        let mut locals = locals;
+        for (_, (abstr_val, availability)) in locals.iter_mut() {
             if rng.gen_bool(0.5) {
                 if *availability == BorrowState::Available {
                     *availability = BorrowState::Unavailable;
@@ -227,17 +228,22 @@ impl CFG {
                     *availability = BorrowState::Available;
                 }
             }
+
+            if abstr_val.is_generic() {
+                *availability = BorrowState::Unavailable;
+            }
         }
         locals
     }
 
     /// Add the incoming and outgoing locals for each basic block in the control flow graph.
     /// Currently the incoming and outgoing locals are the same for each block.
-    fn add_locals(cfg: &mut CFG, mut rng: &mut StdRng, locals: &[SignatureToken], args_len: usize) {
+    fn add_locals(cfg: &mut CFG, rng: &mut StdRng, locals: &[SignatureToken], args_len: usize) {
         precondition!(
             !cfg.basic_blocks.is_empty(),
             "Cannot add locals to empty cfg"
         );
+        debug!("add locals: {:#?}", locals);
         for block_id in 0..cfg.basic_blocks.len() {
             let cfg_copy = cfg.clone();
             let basic_block = cfg
@@ -256,7 +262,10 @@ impl CFG {
                         };
                         (
                             i,
-                            (AbstractValue::new_primitive(token.clone()), borrow_state),
+                            (
+                                AbstractValue::new_value(token.clone(), Kind::Copyable),
+                                borrow_state,
+                            ),
                         )
                     })
                     .collect();
@@ -266,7 +275,7 @@ impl CFG {
                 basic_block.locals_in =
                     cfg_copy.merge_locals(cfg_copy.get_parent_ids(block_id as BlockIDSize));
             }
-            basic_block.locals_out = CFG::vary_locals(&mut rng, basic_block.locals_in.clone());
+            basic_block.locals_out = CFG::vary_locals(rng, basic_block.locals_in.clone());
         }
     }
 

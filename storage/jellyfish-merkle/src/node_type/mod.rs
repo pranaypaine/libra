@@ -14,9 +14,8 @@
 mod node_type_test;
 
 use crate::nibble_path::NibblePath;
-use bincode::{deserialize, serialize};
+use anyhow::{ensure, Context, Result};
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt, WriteBytesExt};
-use failure::{Fail, Result, *};
 use libra_crypto::{
     hash::{CryptoHash, SPARSE_MERKLE_PLACEHOLDER_HASH},
     HashValue,
@@ -40,6 +39,7 @@ use std::{
     io::{prelude::*, Cursor, Read, SeekFrom, Write},
     mem::size_of,
 };
+use thiserror::Error;
 
 /// The unique key of each node.
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
@@ -379,13 +379,14 @@ impl InternalNode {
             // Only 1 leaf child under this subtree or reach the lowest level
             let only_child_index = Nibble::from(range_existence_bitmap.trailing_zeros() as u8);
             self.child(only_child_index)
-                .unwrap_or_else(|| {
-                    unrecoverable!(
+                .with_context(|| {
+                    format!(
                         "Corrupted internal node: existence_bitmap indicates \
                          the existence of a non-exist child at index {:x}",
                         only_child_index
                     )
                 })
+                .unwrap()
                 .hash
         } else {
             let left_child = self.merkle_hash(start, width / 2, (existence_bitmap, leaf_bitmap));
@@ -457,14 +458,15 @@ impl InternalNode {
                     {
                         let only_child_version = self
                             .child(only_child_index)
-                            .unwrap_or_else(|| {
-                                // Should be guaranteed by the self invariants, but these are not easy to express at the moment
-                                unrecoverable!(
+                            // Should be guaranteed by the self invariants, but these are not easy to express at the moment
+                            .with_context(|| {
+                                format!(
                                     "Corrupted internal node: child_bitmap indicates \
                                      the existence of a non-exist child at index {:x}",
                                     only_child_index
                                 )
                             })
+                            .unwrap()
                             .version;
                         Some(node_key.gen_child_node_key(only_child_version, only_child_index))
                     },
@@ -594,10 +596,7 @@ impl Node {
 
     /// Returns `true` if the node is a leaf node.
     pub fn is_leaf(&self) -> bool {
-        match self {
-            Node::Leaf(_) => true,
-            _ => false,
-        }
+        matches!(self, Node::Leaf(_))
     }
 
     /// Serializes to bytes for physical storage.
@@ -613,7 +612,7 @@ impl Node {
             }
             Node::Leaf(leaf_node) => {
                 out.push(NodeTag::Leaf as u8);
-                out.extend(serialize(&leaf_node)?);
+                out.extend(lcs::to_bytes(&leaf_node)?);
             }
         }
         Ok(out)
@@ -638,7 +637,7 @@ impl Node {
         match node_tag {
             Some(NodeTag::Null) => Ok(Node::Null),
             Some(NodeTag::Internal) => Ok(Node::Internal(InternalNode::deserialize(&val[1..])?)),
-            Some(NodeTag::Leaf) => Ok(Node::Leaf(deserialize(&val[1..])?)),
+            Some(NodeTag::Leaf) => Ok(Node::Leaf(lcs::from_bytes(&val[1..])?)),
             None => Err(NodeDecodeError::UnknownTag { unknown_tag: tag }.into()),
         }
     }
@@ -646,24 +645,25 @@ impl Node {
 
 /// Error thrown when a [`Node`] fails to be deserialized out of a byte sequence stored in physical
 /// storage, via [`Node::decode`].
-#[derive(Debug, Fail, Eq, PartialEq)]
+#[derive(Debug, Error, Eq, PartialEq)]
 pub enum NodeDecodeError {
     /// Input is empty.
-    #[fail(display = "Missing tag due to empty input")]
+    #[error("Missing tag due to empty input")]
     EmptyInput,
 
     /// The first byte of the input is not a known tag representing one of the variants.
-    #[fail(display = "lead tag byte is unknown: {}", unknown_tag)]
+    #[error("lead tag byte is unknown: {}", unknown_tag)]
     UnknownTag { unknown_tag: u8 },
 
     /// No children found in internal node
-    #[fail(display = "No children found in internal node")]
+    #[error("No children found in internal node")]
     NoChildren,
 
     /// Extra leaf bits set
-    #[fail(
-        display = "Non-existent leaf bits set, existing: {}, leaves: {}",
-        existing, leaves
+    #[error(
+        "Non-existent leaf bits set, existing: {}, leaves: {}",
+        existing,
+        leaves
     )]
     ExtraLeaves { existing: u16, leaves: u16 },
 }

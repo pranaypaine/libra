@@ -1,30 +1,25 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![forbid(unsafe_code)]
-
 use crate::{
     access_path::{AccessPath, Accesses},
     account_config,
-    event::EventKey,
-    identifier::{IdentStr, Identifier},
+    event::{EventHandle, EventKey},
     language_storage::StructTag,
-    validator_public_keys::ValidatorPublicKeys,
+    validator_info::ValidatorInfo,
 };
-use failure::prelude::*;
-use lazy_static::lazy_static;
+use anyhow::{Error, Result};
+use move_core_types::identifier::{IdentStr, Identifier};
+use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
-use std::{
-    convert::{TryFrom, TryInto},
-    fmt,
-};
+use std::{convert::TryFrom, fmt, vec};
 
-lazy_static! {
-    static ref LIBRA_SYSTEM_MODULE_NAME: Identifier = Identifier::new("LibraSystem").unwrap();
-    static ref VALIDATOR_SET_STRUCT_NAME: Identifier = Identifier::new("ValidatorSet").unwrap();
-}
+static LIBRA_SYSTEM_MODULE_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("LibraSystem").unwrap());
+static VALIDATOR_SET_STRUCT_NAME: Lazy<Identifier> =
+    Lazy::new(|| Identifier::new("ValidatorSet").unwrap());
 
 pub fn validator_set_module_name() -> &'static IdentStr {
     &*LIBRA_SYSTEM_MODULE_NAME
@@ -36,25 +31,77 @@ pub fn validator_set_struct_name() -> &'static IdentStr {
 
 pub fn validator_set_tag() -> StructTag {
     StructTag {
+        address: account_config::CORE_CODE_ADDRESS,
         name: validator_set_struct_name().to_owned(),
-        address: account_config::core_code_address(),
         module: validator_set_module_name().to_owned(),
         type_params: vec![],
     }
 }
 
-pub(crate) fn validator_set_path() -> Vec<u8> {
-    AccessPath::resource_access_vec(&validator_set_tag(), &Accesses::empty())
+/// The access path where the Validator Set resource is stored.
+pub static VALIDATOR_SET_RESOURCE_PATH: Lazy<Vec<u8>> =
+    Lazy::new(|| AccessPath::resource_access_vec(&validator_set_tag(), &Accesses::empty()));
+
+/// The path to the validator set change event handle under a ValidatorSetResource.
+pub static VALIDATOR_SET_CHANGE_EVENT_PATH: Lazy<Vec<u8>> = Lazy::new(|| {
+    let mut path = VALIDATOR_SET_RESOURCE_PATH.to_vec();
+    path.extend_from_slice(b"/change_events_count/");
+    path
+});
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ValidatorSetResource {
+    scheme: ConsensusScheme,
+    validators: Vec<ValidatorInfo>,
+    last_reconfiguration_time: u64,
+    change_events: EventHandle,
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+impl Default for ValidatorSetResource {
+    fn default() -> Self {
+        ValidatorSetResource {
+            scheme: ConsensusScheme::Ed25519,
+            validators: vec![],
+            last_reconfiguration_time: 0,
+            change_events: EventHandle::new(ValidatorSet::change_event_key(), 0),
+        }
+    }
+}
+
+impl ValidatorSetResource {
+    pub fn change_events(&self) -> &EventHandle {
+        &self.change_events
+    }
+
+    pub fn last_reconfiguration_time(&self) -> u64 {
+        self.last_reconfiguration_time
+    }
+
+    pub fn validator_set(&self) -> ValidatorSet {
+        assert_eq!(self.scheme, ConsensusScheme::Ed25519);
+        ValidatorSet::new(self.validators.clone())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[repr(u8)]
+pub enum ConsensusScheme {
+    Ed25519 = 0,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
-pub struct ValidatorSet(Vec<ValidatorPublicKeys>);
+pub struct ValidatorSet {
+    scheme: ConsensusScheme,
+    payload: Vec<ValidatorInfo>,
+}
 
 impl fmt::Display for ValidatorSet {
-    fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "[")?;
-        for validator in &self.0 {
+        for validator in self.payload().iter() {
             write!(f, "{} ", validator)?;
         }
         write!(f, "]")
@@ -63,12 +110,23 @@ impl fmt::Display for ValidatorSet {
 
 impl ValidatorSet {
     /// Constructs a ValidatorSet resource.
-    pub fn new(payload: Vec<ValidatorPublicKeys>) -> Self {
-        ValidatorSet(payload)
+    pub fn new(payload: Vec<ValidatorInfo>) -> Self {
+        Self {
+            scheme: ConsensusScheme::Ed25519,
+            payload,
+        }
     }
 
-    pub fn payload(&self) -> &[ValidatorPublicKeys] {
-        &self.0
+    pub fn scheme(&self) -> ConsensusScheme {
+        self.scheme
+    }
+
+    pub fn payload(&self) -> &[ValidatorInfo] {
+        &self.payload
+    }
+
+    pub fn empty() -> Self {
+        ValidatorSet::new(Vec::new())
     }
 
     pub fn change_event_key() -> EventKey {
@@ -84,20 +142,14 @@ impl TryFrom<crate::proto::types::ValidatorSet> for ValidatorSet {
     type Error = Error;
 
     fn try_from(proto: crate::proto::types::ValidatorSet) -> Result<Self> {
-        Ok(ValidatorSet::new(
-            proto
-                .validator_public_keys
-                .into_iter()
-                .map(TryInto::try_into)
-                .collect::<Result<Vec<_>>>()?,
-        ))
+        Ok(lcs::from_bytes(&proto.bytes)?)
     }
 }
 
 impl From<ValidatorSet> for crate::proto::types::ValidatorSet {
     fn from(set: ValidatorSet) -> Self {
         Self {
-            validator_public_keys: set.0.into_iter().map(Into::into).collect(),
+            bytes: lcs::to_bytes(&set).expect("failed to serialize validator set"),
         }
     }
 }

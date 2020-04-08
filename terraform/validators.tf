@@ -114,218 +114,131 @@ resource "aws_s3_bucket_public_access_block" "config" {
   restrict_public_buckets = true
 }
 
-resource "aws_s3_bucket_object" "network_peers" {
-  bucket = aws_s3_bucket.config.id
-  key    = "network_peers.config.toml"
-  source = "${var.validator_set}/val/network_peers.config.toml"
-  etag   = filemd5("${var.validator_set}/val/network_peers.config.toml")
-}
-
-resource "aws_s3_bucket_object" "consensus_peers" {
-  bucket = aws_s3_bucket.config.id
-  key    = "consensus_peers.config.toml"
-  source = "${var.validator_set}/consensus_peers.config.toml"
-  etag   = filemd5("${var.validator_set}/consensus_peers.config.toml")
-}
-
-resource "aws_s3_bucket_object" "genesis_blob" {
-  bucket = aws_s3_bucket.config.id
-  key    = "genesis.blob"
-  source = "${var.validator_set}/genesis.blob"
-  etag   = filemd5("${var.validator_set}/genesis.blob")
-}
 
 data "template_file" "user_data" {
   template = file("templates/ec2_user_data.sh")
 
   vars = {
-    ecs_cluster     = aws_ecs_cluster.testnet.name
-    network_peers   = "s3://${aws_s3_bucket.config.id}/${aws_s3_bucket_object.network_peers.id}"
-    fullnode_peers  = "s3://${aws_s3_bucket.config.id}/${aws_s3_bucket_object.fullnode_peers.id}"
-    consensus_peers = "s3://${aws_s3_bucket.config.id}/${aws_s3_bucket_object.consensus_peers.id}"
-    genesis_blob    = "s3://${aws_s3_bucket.config.id}/${aws_s3_bucket_object.genesis_blob.id}"
+    persistent       = var.persist_libra_data
+    ecs_cluster      = aws_ecs_cluster.testnet.name
+    host_log_path    = "/data/libra/libra.log"
+    host_structlog_path   = "/data/libra/libra_structlog.log"
+    enable_logrotate = var.log_to_file || var.enable_logstash
   }
 }
 
 locals {
-  image_repo         = var.image_repo
-  instance_public_ip = true
-  user_data          = data.template_file.user_data.rendered
-  image_version      = substr(var.image_tag, 0, 6) == "sha256" ? "@${var.image_tag}" : ":${var.image_tag}"
+  image_repo                 = var.image_repo
+  image_version              = substr(var.image_tag, 0, 6) == "sha256" ? "@${var.image_tag}" : ":${var.image_tag}"
+  override_image_versions    = [for img in var.override_image_tags: substr(img, 0, 6) == "sha256" ? "@${img}" : ":${img}"]
+  safety_rules_image_repo    = var.safety_rules_image_repo
+  safety_rules_image_version = substr(var.safety_rules_image_tag, 0, 6) == "sha256" ? "@${var.safety_rules_image_tag}" : ":${var.safety_rules_image_tag}"
+  instance_public_ip         = true
+  user_data                  = data.template_file.user_data.rendered
+}
+
+resource "aws_ebs_snapshot" "restore_snapshot" {
+  count     = var.restore_vol_id == "" ? 0 : 1
+  volume_id = var.restore_vol_id
+
+  tags = {
+    Name = "${terraform.workspace}-restore-snap"
+  }
 }
 
 resource "aws_instance" "validator" {
-  count         = length(var.peer_ids)
+  count         = var.num_validators
   ami           = local.aws_ecs_ami
   instance_type = var.validator_type
   subnet_id = element(
     aws_subnet.testnet.*.id,
     count.index % length(data.aws_availability_zones.available.names),
   )
-  depends_on                  = [aws_main_route_table_association.testnet, aws_iam_role_policy_attachment.ecs_extra]
+  depends_on                  = [aws_main_route_table_association.testnet, aws_iam_role_policy.ecs_extra]
   vpc_security_group_ids      = [aws_security_group.validator.id]
   associate_public_ip_address = local.instance_public_ip
   key_name                    = aws_key_pair.libra.key_name
   iam_instance_profile        = aws_iam_instance_profile.ecsInstanceRole.name
   user_data                   = local.user_data
 
-  dynamic "root_block_device" {
-    for_each = contains(local.ebs_types, split(var.validator_type, ".")[0]) ? [0] : []
+  dynamic "ebs_block_device" {
+    for_each = contains(local.ebs_types, split(".", var.validator_type)[0]) ? [0] : []
     content {
+      device_name = "/dev/xvdb"
       volume_type = "io1"
-      volume_size = var.validator_ebs_size
+      volume_size = var.restore_vol_id == "" ? var.validator_ebs_size : aws_ebs_snapshot.restore_snapshot.0.volume_size
+      snapshot_id = var.restore_vol_id == "" ? "" : aws_ebs_snapshot.restore_snapshot.0.id
       iops        = var.validator_ebs_size * 50 # max 50iops/gb
     }
   }
 
   tags = {
-    Name      = "${terraform.workspace}-validator-${substr(var.peer_ids[count.index], 0, 8)}"
+    Name      = "${terraform.workspace}-validator-${count.index}"
     Role      = "validator"
     Workspace = terraform.workspace
-    PeerId    = var.peer_ids[count.index]
+    NodeIndex = count.index
   }
-
-}
-
-data "local_file" "consensus_keys" {
-  count    = length(var.peer_ids)
-  filename = "${var.validator_set}/val/${var.peer_ids[count.index]}.node.consensus.keys.toml"
-}
-
-resource "aws_secretsmanager_secret" "validator_consensus" {
-  count                   = length(var.peer_ids)
-  name                    = "${terraform.workspace}-consensus-${substr(var.peer_ids[count.index], 0, 8)}"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "validator_consensus" {
-  count         = length(var.peer_ids)
-  secret_id     = element(aws_secretsmanager_secret.validator_consensus.*.id, count.index)
-  secret_string = element(data.local_file.consensus_keys.*.content, count.index)
-}
-
-data "local_file" "network_keys" {
-  count    = length(var.peer_ids)
-  filename = "${var.validator_set}/val/${var.peer_ids[count.index]}.node.network.keys.toml"
-}
-
-resource "aws_secretsmanager_secret" "validator_network" {
-  count                   = length(var.peer_ids)
-  name                    = "${terraform.workspace}-network-${substr(var.peer_ids[count.index], 0, 8)}"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "validator_network" {
-  count         = length(var.peer_ids)
-  secret_id     = element(aws_secretsmanager_secret.validator_network.*.id, count.index)
-  secret_string = element(data.local_file.network_keys.*.content, count.index)
-}
-
-data "local_file" "validator_fullnode_keys" {
-  count    = length(var.peer_ids)
-  filename = "${var.validator_set}/val/${var.validator_fullnode_id[0]}.network.keys.toml"
-}
-
-resource "aws_secretsmanager_secret" "validator_fullnode" {
-  count                   = 1
-  name                    = "${terraform.workspace}-validator_fullnode-${substr(var.validator_fullnode_id[0], 0, 8)}"
-  recovery_window_in_days = 0
-}
-
-resource "aws_secretsmanager_secret_version" "validator_fullnode" {
-  count         = length(var.peer_ids)
-  secret_id     = element(aws_secretsmanager_secret.validator_fullnode.*.id, count.index)
-  secret_string = element(data.local_file.validator_fullnode_keys.*.content, count.index)
-}
-
-data "template_file" "validator_config" {
-  count    = length(var.peer_ids)
-  template = file("${var.validator_set}/val/node.config.toml")
-
-  vars = {
-    self_ip     = var.validator_use_public_ip == true ? element(aws_instance.validator.*.public_ip, count.index) : element(aws_instance.validator.*.private_ip, count.index)
-    peer_id     = var.peer_ids[count.index]
-    fullnode_id = var.validator_fullnode_id[0]
-  }
-}
-
-data "template_file" "seed_peers" {
-  template = file("templates/seed_peers.config.toml")
-
-  vars = {
-    validators = join(",", formatlist("%s:%s", slice(var.peer_ids, 0, 3), var.validator_use_public_ip == true ? slice(aws_instance.validator.*.public_ip, 0, 3) : slice(aws_instance.validator.*.private_ip, 0, 3)))
-    port       = 6180
-  }
-}
-
-variable "log_to_file" {
-  type        = bool
-  default     = false
-  description = "Set to true to log to /opt/libra/data/libra.log (in container) and /data/libra/libra.log (on host). This file won't be log rotated, you need to handle log rotation on your own if you choose this option"
 }
 
 locals {
-  validator_command = var.log_to_file ? jsonencode(["bash", "-c", "/docker-run.sh >> /opt/libra/data/libra.log 2>&1"]) : ""
+  seed_peer_ip           = aws_instance.validator.0.private_ip
+  validator_command      = var.log_to_file || var.enable_logstash ? jsonencode(["bash", "-c", "/docker-run-dynamic.sh >> ${var.log_path} 2>&1"]) : ""
+  aws_elasticsearch_host = var.enable_logstash ? join(",", aws_elasticsearch_domain.logging.*.endpoint) : ""
+  logstash_config        = "input { file { path => '${var.structlog_path}'\\n codec => 'json'\\n}}\\n filter {  json {  \\nsource => 'message'\\n}}\\n output {  amazon_es { \\nhosts => ['https://${local.aws_elasticsearch_host}']\\nregion => 'us-west-2'\\nindex => 'validator-logs-%%{+YYYY.MM.dd}'\\n}}"
 }
 
 data "template_file" "ecs_task_definition" {
-  count    = length(var.peer_ids)
+  count    = var.num_validators
   template = file("templates/validator.json")
 
   vars = {
-    image            = local.image_repo
-    image_version    = local.image_version
-    cpu              = local.cpu_by_instance[var.validator_type]
-    mem              = local.mem_by_instance[var.validator_type]
-    node_config      = jsonencode(element(data.template_file.validator_config.*.rendered, count.index))
-    seed_peers       = jsonencode(data.template_file.seed_peers.rendered)
-    genesis_blob     = jsonencode(filebase64("${var.validator_set}/genesis.blob"))
-    peer_id          = var.peer_ids[count.index]
-    network_secret   = element(aws_secretsmanager_secret.validator_network.*.arn, count.index)
-    consensus_secret = element(aws_secretsmanager_secret.validator_consensus.*.arn, count.index)
-    fullnode_secret  = element(aws_secretsmanager_secret.validator_fullnode.*.arn, count.index)
-    log_level        = var.validator_log_level
-    log_group        = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
-    log_region       = var.region
-    log_prefix       = "validator-${substr(var.peer_ids[count.index], 0, 8)}"
-    capabilities     = jsonencode(var.validator_linux_capabilities)
-    command          = local.validator_command
+    image                         = local.image_repo
+    image_version                 = local.override_image_versions == [] ? local.image_version : local.override_image_versions[count.index % length(local.override_image_versions)]
+    cpu                           = (var.enable_logstash ? local.cpu_by_instance[var.validator_type] - 584 : local.cpu_by_instance[var.validator_type]) - 512
+    mem                           = (var.enable_logstash ? local.mem_by_instance[var.validator_type] - 1024 : local.mem_by_instance[var.validator_type]) - 256
+    cfg_listen_addr               = var.validator_use_public_ip == true ? element(aws_instance.validator.*.public_ip, count.index) : element(aws_instance.validator.*.private_ip, count.index)
+    cfg_node_index                = count.index
+    cfg_num_validators            = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
+    cfg_num_validators_in_genesis = var.num_validators_in_genesis == 0? var.num_validators : var.num_validators_in_genesis
+    cfg_seed                      = var.config_seed
+    cfg_seed_peer_ip              = local.seed_peer_ip
+
+    cfg_fullnode_seed = count.index < var.num_fullnode_networks ? var.fullnode_seed : ""
+    cfg_num_fullnodes = var.num_fullnodes
+
+    log_level                  = var.validator_log_level
+    log_group                  = var.cloudwatch_logs ? aws_cloudwatch_log_group.testnet.name : ""
+    log_region                 = var.region
+    log_prefix                 = "validator-${count.index}"
+    capabilities               = jsonencode(var.validator_linux_capabilities)
+    command                    = local.validator_command
+    logstash                   = var.enable_logstash
+    logstash_image             = var.logstash_image
+    logstash_version           = ":${var.logstash_version}"
+    logstash_config            = local.logstash_config
+    safety_rules_image         = local.safety_rules_image_repo
+    safety_rules_image_version = local.safety_rules_image_version
+    push_metrics_endpoint      = "http://${aws_instance.monitoring.private_ip}:9092/metrics/job/safety_rules/role/validator/peer_id/val-${count.index}"
+    cfg_vault_addr             = "http://${aws_instance.vault.private_ip}:8200"
+    cfg_vault_namespace        = "val-${count.index}"
+    use_vault                  = var.safety_rules_use_vault
+    structlog_path             = var.log_to_file || var.enable_logstash ? var.structlog_path : ""
   }
 }
 
 resource "aws_ecs_task_definition" "validator" {
-  count  = length(var.peer_ids)
-  family = "${terraform.workspace}-validator-${substr(var.peer_ids[count.index], 0, 8)}"
+  count  = var.num_validators
+  family = "${terraform.workspace}-validator-${count.index}"
   container_definitions = element(
     data.template_file.ecs_task_definition.*.rendered,
-    count.index,
+    count.index
   )
   execution_role_arn = aws_iam_role.ecsTaskExecutionRole.arn
   network_mode       = "host"
 
   volume {
     name      = "libra-data"
-    host_path = "/data/libra"
-  }
-
-  volume {
-    name      = "consensus-peers"
-    host_path = "/opt/libra/consensus_peers.config.toml"
-  }
-
-  volume {
-    name      = "network-peers"
-    host_path = "/opt/libra/network_peers.config.toml"
-  }
-
-  volume {
-    name      = "fullnode-peers"
-    host_path = "/opt/libra/fullnode_peers.config.toml"
-  }
-
-  volume {
-    name      = "genesis-blob"
-    host_path = "/opt/libra/genesis.blob"
+    host_path = var.persist_libra_data ? "/data/libra" : ""
   }
 
   placement_constraints {
@@ -334,7 +247,7 @@ resource "aws_ecs_task_definition" "validator" {
   }
 
   tags = {
-    PeerId    = "${substr(var.peer_ids[count.index], 0, 8)}"
+    NodeIndex = count.index
     Role      = "validator"
     Workspace = terraform.workspace
   }
@@ -345,15 +258,15 @@ resource "aws_ecs_cluster" "testnet" {
 }
 
 resource "aws_ecs_service" "validator" {
-  count                              = length(var.peer_ids)
-  name                               = "${terraform.workspace}-validator-${substr(var.peer_ids[count.index], 0, 8)}"
+  count                              = var.num_validators
+  name                               = "${terraform.workspace}-validator-${count.index}"
   cluster                            = aws_ecs_cluster.testnet.id
   task_definition                    = element(aws_ecs_task_definition.validator.*.arn, count.index)
   desired_count                      = 1
   deployment_minimum_healthy_percent = 0
 
   tags = {
-    PeerId    = "${substr(var.peer_ids[count.index], 0, 8)}"
+    NodeIndex = count.index
     Role      = "validator"
     Workspace = terraform.workspace
   }

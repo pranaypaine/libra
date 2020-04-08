@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use failure::ensure;
+use anyhow::ensure;
 #[cfg(test)]
 use libra_crypto::hash::{CryptoHash, TestOnlyHasher, ACCUMULATOR_PLACEHOLDER_HASH};
 use libra_crypto::hash::{CryptoHasher, HashValue};
@@ -15,7 +15,7 @@ use std::marker::PhantomData;
 /// returns the new tree to acquire a new root and version. Note: this is used internally by
 /// VoteProposal hence why it exists within consensus-types andd not libra-types.
 /// @TODO This should contain AccumulatorConsistencyProof once that is code complete
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct AccumulatorExtensionProof<H> {
     /// Represents the roots of all the full subtrees from left to right in the original accumulator.
     frozen_subtree_roots: Vec<HashValue>,
@@ -41,7 +41,7 @@ impl<H: CryptoHasher> AccumulatorExtensionProof<H> {
         }
     }
 
-    pub fn verify(&self, original_root: HashValue) -> failure::Result<InMemoryAccumulator<H>> {
+    pub fn verify(&self, original_root: HashValue) -> anyhow::Result<InMemoryAccumulator<H>> {
         let original_tree =
             InMemoryAccumulator::<H>::new(self.frozen_subtree_roots.clone(), self.num_leaves)?;
         ensure!(

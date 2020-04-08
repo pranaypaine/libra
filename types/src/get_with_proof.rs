@@ -6,7 +6,7 @@
 use crate::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::get_account_resource_or_default,
+    account_config::AccountResource,
     account_state_blob::AccountStateWithProof,
     contract_event::EventWithProof,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
@@ -18,21 +18,20 @@ use crate::{
         GetEventsByEventAccessPathResponse, GetTransactionsRequest, GetTransactionsResponse,
     },
     transaction::{TransactionListWithProof, TransactionWithProof, Version},
-    validator_change::ValidatorChangeEventWithProof,
-    validator_verifier::ValidatorVerifier,
+    trusted_state::{TrustedState, TrustedStateChange},
+    validator_change::ValidatorChangeProof,
 };
-use failure::prelude::*;
-use libra_crypto::{hash::CryptoHash, *};
+use anyhow::{bail, ensure, format_err, Error, Result};
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
+use serde::{Deserialize, Serialize};
 use std::{
     cmp,
     convert::{TryFrom, TryInto},
     mem,
-    sync::Arc,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct UpdateToLatestLedgerRequest {
     pub client_known_version: u64,
@@ -76,17 +75,15 @@ impl From<UpdateToLatestLedgerRequest> for crate::proto::types::UpdateToLatestLe
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct UpdateToLatestLedgerResponse<Sig> {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UpdateToLatestLedgerResponse {
     pub response_items: Vec<ResponseItem>,
-    pub ledger_info_with_sigs: LedgerInfoWithSignatures<Sig>,
-    pub validator_change_events: ValidatorChangeEventWithProof<Sig>,
+    pub ledger_info_with_sigs: LedgerInfoWithSignatures,
+    pub validator_change_proof: ValidatorChangeProof,
     pub ledger_consistency_proof: AccumulatorConsistencyProof,
 }
 
-impl<Sig: Signature> TryFrom<crate::proto::types::UpdateToLatestLedgerResponse>
-    for UpdateToLatestLedgerResponse<Sig>
-{
+impl TryFrom<crate::proto::types::UpdateToLatestLedgerResponse> for UpdateToLatestLedgerResponse {
     type Error = Error;
 
     fn try_from(proto: crate::proto::types::UpdateToLatestLedgerResponse) -> Result<Self> {
@@ -99,8 +96,8 @@ impl<Sig: Signature> TryFrom<crate::proto::types::UpdateToLatestLedgerResponse>
             .ledger_info_with_sigs
             .unwrap_or_else(Default::default)
             .try_into()?;
-        let validator_change_events = proto
-            .validator_change_events
+        let validator_change_proof = proto
+            .validator_change_proof
             .unwrap_or_else(Default::default)
             .try_into()?;
         let ledger_consistency_proof = proto
@@ -111,46 +108,44 @@ impl<Sig: Signature> TryFrom<crate::proto::types::UpdateToLatestLedgerResponse>
         Ok(Self {
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         })
     }
 }
 
-impl<Sig: Signature> From<UpdateToLatestLedgerResponse<Sig>>
-    for crate::proto::types::UpdateToLatestLedgerResponse
-{
-    fn from(response: UpdateToLatestLedgerResponse<Sig>) -> Self {
+impl From<UpdateToLatestLedgerResponse> for crate::proto::types::UpdateToLatestLedgerResponse {
+    fn from(response: UpdateToLatestLedgerResponse) -> Self {
         let response_items = response
             .response_items
             .into_iter()
             .map(Into::into)
             .collect();
         let ledger_info_with_sigs = Some(response.ledger_info_with_sigs.into());
-        let validator_change_events = Some(response.validator_change_events.into());
+        let validator_change_proof = Some(response.validator_change_proof.into());
         let ledger_consistency_proof = Some(response.ledger_consistency_proof.into());
 
         Self {
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         }
     }
 }
 
-impl<Sig: Signature> UpdateToLatestLedgerResponse<Sig> {
+impl UpdateToLatestLedgerResponse {
     /// Constructor.
     pub fn new(
         response_items: Vec<ResponseItem>,
-        ledger_info_with_sigs: LedgerInfoWithSignatures<Sig>,
-        validator_change_events: ValidatorChangeEventWithProof<Sig>,
+        ledger_info_with_sigs: LedgerInfoWithSignatures,
+        validator_change_proof: ValidatorChangeProof,
         ledger_consistency_proof: AccumulatorConsistencyProof,
     ) -> Self {
         UpdateToLatestLedgerResponse {
             response_items,
             ledger_info_with_sigs,
-            validator_change_events,
+            validator_change_proof,
             ledger_consistency_proof,
         }
     }
@@ -160,34 +155,34 @@ impl<Sig: Signature> UpdateToLatestLedgerResponse<Sig> {
     ///
     /// After calling this one can trust the info in the response items without further
     /// verification.
-    pub fn verify(
-        &self,
-        validator_verifier: Arc<ValidatorVerifier<Sig::VerifyingKeyMaterial>>,
+    pub fn verify<'a>(
+        &'a self,
+        trusted_state: &TrustedState,
         request: &UpdateToLatestLedgerRequest,
-    ) -> Result<()> {
+    ) -> Result<TrustedStateChange<'a>> {
         verify_update_to_latest_ledger_response(
-            validator_verifier,
+            trusted_state,
             request.client_known_version,
             &request.requested_items,
             &self.response_items,
             &self.ledger_info_with_sigs,
+            &self.validator_change_proof,
         )
     }
 }
 
 /// Verifies content of an [`UpdateToLatestLedgerResponse`] against the proofs it
 /// carries and the content of the corresponding [`UpdateToLatestLedgerRequest`]
-pub fn verify_update_to_latest_ledger_response<Sig: Signature>(
-    validator_verifier: Arc<ValidatorVerifier<Sig::VerifyingKeyMaterial>>,
+/// Return EpochInfo if there're validator change events.
+pub fn verify_update_to_latest_ledger_response<'a>(
+    trusted_state: &TrustedState,
     req_client_known_version: u64,
     req_request_items: &[RequestItem],
     response_items: &[ResponseItem],
-    ledger_info_with_sigs: &LedgerInfoWithSignatures<Sig>,
-) -> Result<()> {
-    let (ledger_info, signatures) = (
-        ledger_info_with_sigs.ledger_info(),
-        ledger_info_with_sigs.signatures(),
-    );
+    ledger_info_with_sigs: &'a LedgerInfoWithSignatures,
+    validator_change_proof: &'a ValidatorChangeProof,
+) -> Result<TrustedStateChange<'a>> {
+    let ledger_info = ledger_info_with_sigs.ledger_info();
 
     // Verify that the same or a newer ledger info is returned.
     ensure!(
@@ -197,10 +192,10 @@ pub fn verify_update_to_latest_ledger_response<Sig: Signature>(
         req_client_known_version,
     );
 
-    // Verify ledger info signatures.
-    if !(ledger_info.version() == 0 && signatures.is_empty()) {
-        validator_verifier.batch_verify_aggregated_signature(ledger_info.hash(), signatures)?;
-    }
+    // Verify any validator change proof and latest ledger info. Provide an
+    // updated trusted state if the proof is correct and not stale.
+    let trusted_state_change =
+        trusted_state.verify_and_ratchet(ledger_info_with_sigs, validator_change_proof)?;
 
     // Verify each sub response.
     ensure!(
@@ -213,7 +208,7 @@ pub fn verify_update_to_latest_ledger_response<Sig: Signature>(
         .map(|(req, res)| verify_response_item(ledger_info, req, res))
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(())
+    Ok(trusted_state_change)
 }
 
 fn verify_response_item(
@@ -319,9 +314,16 @@ fn verify_get_txn_by_seq_num_resp(
             )
         },
         (None, Some(proof_of_current_sequence_number)) => {
-            let sequence_number_in_ledger =
-                get_account_resource_or_default(&proof_of_current_sequence_number.blob)?
-                    .sequence_number();
+            let sequence_number_in_ledger = {
+                if let Some(blob) = &proof_of_current_sequence_number.blob {
+                    AccountResource::try_from(blob)?.sequence_number()
+                } else {
+                    // Account does not exist. From the sequence number perspective, it's
+                    // equivalent to the situation when the account does exist but has never sent
+                    // a transaction. Use default value of sequence number.
+                    0
+                }
+            };
             ensure!(
                 sequence_number_in_ledger <= req_sequence_number,
                 "Server returned no transactions while it should. Seq num requested: {}, latest seq num in ledger: {}.",
@@ -347,17 +349,10 @@ fn verify_get_events_by_access_path_resp(
     events_with_proof: &[EventWithProof],
     proof_of_latest_event: &AccountStateWithProof,
 ) -> Result<()> {
-    let account_resource = get_account_resource_or_default(&proof_of_latest_event.blob)?;
-    let (seq_num_upper_bound, expected_event_key) = {
-        proof_of_latest_event.verify(
-            ledger_info,
-            ledger_info.version(),
-            req_access_path.address,
-        )?;
-        let event_handle =
-            account_resource.get_event_handle_by_query_path(&req_access_path.path)?;
-        (event_handle.count(), event_handle.key())
-    };
+    proof_of_latest_event.verify(ledger_info, ledger_info.version(), req_access_path.address)?;
+
+    let (expected_event_key_opt, seq_num_upper_bound) =
+        proof_of_latest_event.get_event_key_and_count_by_query_path(&req_access_path.path)?;
 
     let cursor =
         if !req_ascending && req_start_seq_num == u64::max_value() && seq_num_upper_bound > 0 {
@@ -386,17 +381,21 @@ fn verify_get_events_by_access_path_resp(
         expected_seq_nums.len(),
         events_with_proof.len(),
     );
-    itertools::zip_eq(events_with_proof, expected_seq_nums)
-        .map(|(e, seq_num)| {
-            e.verify(
-                ledger_info,
-                expected_event_key,
-                seq_num,
-                e.transaction_version,
-                e.event_index,
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
+    if let Some(expected_event_key) = expected_event_key_opt {
+        itertools::zip_eq(events_with_proof, expected_seq_nums)
+            .map(|(e, seq_num)| {
+                e.verify(
+                    ledger_info,
+                    &expected_event_key,
+                    seq_num,
+                    e.transaction_version,
+                    e.event_index,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+    } else if !events_with_proof.is_empty() {
+        bail!("Bad events_with_proof: nonempty event list for nonexistent account")
+    } // else, empty event list for nonexistent account, which is fine
 
     Ok(())
 }
@@ -430,7 +429,7 @@ fn verify_get_txns_resp(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub enum RequestItem {
     GetAccountTransactionBySequenceNumber {
@@ -566,7 +565,7 @@ impl From<RequestItem> for crate::proto::types::RequestItem {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub enum ResponseItem {
     GetAccountTransactionBySequenceNumber {

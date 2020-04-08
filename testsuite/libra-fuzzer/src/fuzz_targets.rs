@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{FuzzTarget, FuzzTargetImpl};
-use failure::prelude::*;
-use lazy_static::lazy_static;
+use anyhow::{format_err, Result};
+use once_cell::sync::Lazy;
 use std::{collections::BTreeMap, env};
 
 /// Convenience macro to return the module name.
@@ -56,32 +56,36 @@ macro_rules! proto_fuzz_target {
 
 // List fuzz target modules here.
 mod accumulator_merkle_proof;
-mod admission_control;
 mod compiled_module;
 mod consensus_proposal;
 mod inbound_rpc_protocol;
 mod inner_signed_transaction;
+mod json_rpc_service;
+mod network_noise_initiator;
+mod network_noise_responder;
 mod signed_transaction;
 mod sparse_merkle_proof;
 mod vm_value;
 
-lazy_static! {
-    static ref ALL_TARGETS: BTreeMap<&'static str, Box<dyn FuzzTargetImpl>> = {
-        let targets: Vec<Box<dyn FuzzTargetImpl>> = vec![
-            // List fuzz targets here in this format.
-            Box::new(compiled_module::CompiledModuleTarget::default()),
-            Box::new(signed_transaction::SignedTransactionTarget::default()),
-            Box::new(inner_signed_transaction::SignedTransactionTarget::default()),
-            Box::new(sparse_merkle_proof::SparseMerkleProofTarget::default()),
-            Box::new(accumulator_merkle_proof::AccumulatorProofTarget::default()),
-            Box::new(vm_value::ValueTarget::default()),
-            Box::new(consensus_proposal::ConsensusProposal::default()),
-            Box::new(admission_control::AdmissionControlSubmitTransactionRequest::default()),
-            Box::new(inbound_rpc_protocol::RpcInboundRequest::default()),
-        ];
-        targets.into_iter().map(|target| (target.name(), target)).collect()
-    };
-}
+static ALL_TARGETS: Lazy<BTreeMap<&'static str, Box<dyn FuzzTargetImpl>>> = Lazy::new(|| {
+    let targets: Vec<Box<dyn FuzzTargetImpl>> = vec![
+        // List fuzz targets here in this format.
+        Box::new(compiled_module::CompiledModuleTarget::default()),
+        Box::new(signed_transaction::SignedTransactionTarget::default()),
+        Box::new(inner_signed_transaction::SignedTransactionTarget::default()),
+        Box::new(sparse_merkle_proof::SparseMerkleProofTarget::default()),
+        Box::new(vm_value::ValueTarget::default()),
+        Box::new(consensus_proposal::ConsensusProposal::default()),
+        Box::new(json_rpc_service::JsonRpcSubmitTransactionRequest::default()),
+        Box::new(inbound_rpc_protocol::RpcInboundRequest::default()),
+        Box::new(network_noise_initiator::NetworkNoiseInitiator::default()),
+        Box::new(network_noise_responder::NetworkNoiseResponder::default()),
+    ];
+    targets
+        .into_iter()
+        .map(|target| (target.name(), target))
+        .collect()
+});
 
 impl FuzzTarget {
     /// The environment variable used for passing fuzz targets to child processes.

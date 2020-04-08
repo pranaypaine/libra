@@ -1,13 +1,13 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use channel;
 use futures::{Future, FutureExt, SinkExt};
 use libra_logger::prelude::*;
 use std::{
     pin::Pin,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use thiserror::Error;
 use tokio::{runtime::Handle, time::delay_for};
 
 /// Time service is an abstraction for operations that depend on time
@@ -135,13 +135,12 @@ pub enum WaitingSuccess {
 }
 
 /// Error states for wait_if_possible
-#[derive(Debug, PartialEq, Eq, Fail)]
+#[derive(Debug, PartialEq, Eq, Error)]
+#[error("{:?}", self)]
 pub enum WaitingError {
     /// The waiting period exceeds the maximum allowed duration, returning immediately
-    #[fail(display = "MaxWaitExceeded")]
     MaxWaitExceeded,
     /// Waiting to ensure the current time exceeds min_duration_since_epoch failed
-    #[fail(display = "WaitFailed")]
     WaitFailed {
         current_duration_since_epoch: Duration,
         wait_duration: Duration,
